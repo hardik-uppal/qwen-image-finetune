@@ -196,7 +196,7 @@ class ImageProcessor:
             else:
                 raise ValueError("target_size and target_pixels and controls_size and controls_pixels are all None")
 
-        if isinstance(self.controls_size, list) and isinstance(self.controls_size[0], (int, float)):
+        if isinstance(self.controls_size, list) and len(self.controls_size) > 0 and isinstance(self.controls_size[0], (int, float)):
             self.controls_size = [self.controls_size]
         if isinstance(self.controls_pixels, int):
             self.controls_pixels = [self.controls_pixels]
@@ -204,13 +204,13 @@ class ImageProcessor:
         # make it devisible by 16 for shapes and pixels
         if self.target_size is not None:
             self.target_size = self.make_divisible(self.target_size)
-        if self.controls_size is not None:
+        if self.controls_size is not None and len(self.controls_size) > 0:
             self.controls_size = [self.make_divisible(size) for size in self.controls_size]
         if self.target_pixels is not None:
             self.target_pixels = best_area_near(self.target_pixels)['best_area']
             logging.info(f"target_pixels after best_hw_given_area {self.target_pixels}")
             # self.target_pixels = 32*32*(self.target_pixels//(32*32))
-        if self.controls_pixels is not None:
+        if self.controls_pixels is not None and len(self.controls_pixels) > 0:
             self.controls_pixels = [best_area_near(pixel)['best_area'] for pixel in self.controls_pixels]
             # self.controls_pixels = [32*32*(size//(32*32)) for size in self.controls_pixels]
             logging.info(f"controls_pixels after best_hw_given_area {self.controls_pixels}")
@@ -273,11 +273,11 @@ class ImageProcessor:
         # 处理控制图像（如果存在）
         if 'control' in data:
             control = self.any2numpy(data['control'])
-            if controls_size is not None:
+            if controls_size is not None and len(controls_size) > 0:
                 controls_size_0 = controls_size[0]
             else:
-                controls_size_0 = None
-            if controls_pixels is not None:
+                controls_size_0 = target_size  # Fallback to target_size if no controls_size specified
+            if controls_pixels is not None and len(controls_pixels) > 0:
                 controls_pixels_0 = controls_pixels[0]
             else:
                 controls_pixels_0 = None
@@ -288,11 +288,11 @@ class ImageProcessor:
             controls = [self.any2numpy(x) for x in data['controls']]
             new_controls = []
             for i in range(len(controls)):
-                if controls_size is not None:
+                if controls_size is not None and (i+1) < len(controls_size):
                     controls_size_i = controls_size[i+1]  # index starting from 1,
                 else:
-                    controls_size_i = None
-                if controls_pixels is not None:
+                    controls_size_i = target_size  # Fallback to target_size if no controls_size specified
+                if controls_pixels is not None and (i+1) < len(controls_pixels):
                     controls_pixels_i = controls_pixels[i+1]
                 else:
                     controls_pixels_i = None

@@ -34,8 +34,9 @@ def log_images_auto(accelerator, tag, images, step, caption=None, nrow=4, max_im
             npimg = grid.permute(1, 2, 0).numpy()            # HWC
             run.log({tag: wandb.Image(npimg, caption=caption)}, step=step)
             logged = True
-    except Exception:
-        pass
+            logging.info(f"Logged image '{tag}' to wandb at step {step}")
+    except Exception as e:
+        logging.warning(f"Failed to log image to wandb: {e}")
 
     # 2) TensorBoard
     try:

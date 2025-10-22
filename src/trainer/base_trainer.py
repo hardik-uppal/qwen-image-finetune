@@ -297,9 +297,38 @@ class BaseTrainer(ABC):
         gc.collect()
 
     def setup_validation(self, train_dataloader):
-        """Setup validation"""
+        """Setup validation sampler and cache embeddings"""
         self.validation_sampler = None
-        # TODO: do it later
+        
+        # Check if sampling is enabled
+        if not self.config.logging.sampling.enable:
+            logging.info("Validation sampling disabled in config")
+            return
+        
+        from src.validation.validation_sampler import ValidationSampler
+        
+        # Create validation sampler
+        self.validation_sampler = ValidationSampler(
+            config=self.config.logging.sampling,
+            accelerator=self.accelerator,
+            weight_dtype=self.weight_dtype,
+            data_config=self.config.data,
+        )
+        
+        # Setup validation dataset
+        self.validation_sampler.setup_validation_dataset(train_dataloader.dataset)
+        
+        # Cache embeddings for validation
+        if hasattr(self, 'vae') and hasattr(self, 'text_encoder'):
+            logging.info("Caching validation embeddings...")
+            try:
+                self.validation_sampler.cache_embeddings(self)
+                logging.info(f"Successfully cached {len(self.validation_sampler.cached_embeddings)} validation samples")
+            except Exception as e:
+                logging.warning(f"Failed to cache validation embeddings: {e}")
+                self.validation_sampler = None
+        else:
+            logging.warning("Models not loaded, cannot cache validation embeddings")
 
     def clip_gradients(self):
         """Clip gradients"""
@@ -331,6 +360,9 @@ class BaseTrainer(ABC):
         pass
 
     def forward_loss(self, model_pred, target, weighting=None, edit_mask=None):
+        """Compute loss with optional mask-based breakdown"""
+        loss_dict = {}
+        
         if edit_mask is None:
             if weighting is None:
                 loss = torch.nn.functional.mse_loss(model_pred, target, reduction="mean")
@@ -340,10 +372,106 @@ class BaseTrainer(ABC):
                     1,
                 )
                 loss = loss.mean()
+            loss_dict['total_loss'] = loss
         else:
             # shape torch.Size([4, 864, 1216]) torch.Size([4, 4104, 64]) torch.Size([4, 4104, 64]) torch.Size([4, 1, 1])
             loss = self.criterion(edit_mask, model_pred, target, weighting)
-        return loss
+            loss_dict['total_loss'] = loss
+            
+            # Compute foreground/background breakdown if mask loss is enabled
+            if self.config.loss.mask_loss and edit_mask is not None:
+                with torch.no_grad():
+                    squared_error = (model_pred.float() - target.float()) ** 2
+                    if weighting is not None:
+                        squared_error = weighting.float() * squared_error
+                    
+                    # Reshape to match mask dimensions
+                    squared_error_flat = squared_error.reshape(target.shape[0], -1)
+                    mask_flat = edit_mask.reshape(edit_mask.shape[0], -1)
+                    
+                    # Compute foreground and background losses
+                    fg_mask = mask_flat > 0.5
+                    bg_mask = ~fg_mask
+                    
+                    if fg_mask.any():
+                        fg_loss = squared_error_flat[fg_mask].mean()
+                        loss_dict['fg_loss'] = fg_loss
+                    
+                    if bg_mask.any():
+                        bg_loss = squared_error_flat[bg_mask].mean()
+                        loss_dict['bg_loss'] = bg_loss
+                    
+                    # Compute mask coverage
+                    mask_coverage = fg_mask.float().mean()
+                    loss_dict['mask_coverage'] = mask_coverage
+        
+        return loss_dict if len(loss_dict) > 1 else loss_dict['total_loss']
+    
+    def log_enhanced_metrics(self, batch_data=None):
+        """Log enhanced metrics including gradients, parameters, and memory usage"""
+        metrics = {}
+        
+        # Log gradient norms
+        if hasattr(self.config.logging, 'log_gradients') and self.config.logging.log_gradients:
+            try:
+                # Compute global gradient norm across all parameters
+                total_norm = 0.0
+                lora_norm = 0.0
+                
+                for name, param in self.dit.named_parameters():
+                    if param.grad is not None:
+                        param_norm = param.grad.data.norm(2).item()
+                        total_norm += param_norm ** 2
+                        
+                        if 'lora' in name.lower():
+                            lora_norm += param_norm ** 2
+                
+                total_norm = total_norm ** 0.5
+                lora_norm = lora_norm ** 0.5
+                
+                metrics['gradients/global_norm'] = total_norm
+                if lora_norm > 0:
+                    metrics['gradients/lora_norm'] = lora_norm
+            except Exception as e:
+                logging.debug(f"Failed to compute gradient norms: {e}")
+        
+        # Log parameter statistics
+        if hasattr(self.config.logging, 'log_parameters') and self.config.logging.log_parameters:
+            try:
+                lora_params = []
+                for name, param in self.dit.named_parameters():
+                    if 'lora' in name.lower() and param.requires_grad:
+                        lora_params.append(param.data.flatten())
+                
+                if len(lora_params) > 0:
+                    all_lora_params = torch.cat(lora_params)
+                    metrics['parameters/mean'] = all_lora_params.mean().item()
+                    metrics['parameters/std'] = all_lora_params.std().item()
+                    metrics['parameters/max'] = all_lora_params.max().item()
+                    metrics['parameters/min'] = all_lora_params.min().item()
+            except Exception as e:
+                logging.debug(f"Failed to compute parameter statistics: {e}")
+        
+        # Log memory usage
+        if hasattr(self.config.logging, 'log_memory') and self.config.logging.log_memory:
+            try:
+                if torch.cuda.is_available():
+                    # Convert bytes to GB
+                    allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+                    reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+                    max_allocated = torch.cuda.max_memory_allocated() / (1024 ** 3)
+                    
+                    metrics['memory/allocated_gb'] = allocated
+                    metrics['memory/reserved_gb'] = reserved
+                    metrics['memory/max_allocated_gb'] = max_allocated
+            except Exception as e:
+                logging.debug(f"Failed to compute memory statistics: {e}")
+        
+        # Log to accelerator if we have metrics
+        if metrics and self.accelerator.is_main_process:
+            self.accelerator.log(metrics, step=self.global_step)
+        
+        return metrics
 
     def train_epoch(self, epoch, train_dataloader):
         for _, batch in enumerate(train_dataloader):
@@ -365,6 +493,11 @@ class BaseTrainer(ABC):
                 self.optimizer.step()
                 self.lr_scheduler.step()
                 self.optimizer.zero_grad()
+            
+            # Clear cache periodically to prevent memory buildup with large images
+            if self.global_step % 10 == 0:
+                torch.cuda.empty_cache()
+            
             if self.accelerator.sync_gradients:
                 avg_loss = self.accelerator.gather(loss.detach()).mean()
                 self.train_loss = avg_loss.item() / self.config.train.gradient_accumulation_steps
@@ -378,6 +511,12 @@ class BaseTrainer(ABC):
                         "fps": self.fps_logger.total_fps(),
                     }
                 )
+                
+                # Log enhanced metrics periodically
+                enhanced_interval = getattr(self.config.logging, 'enhanced_metrics_interval', 10)
+                if self.global_step % enhanced_interval == 0:
+                    self.log_enhanced_metrics(batch_data=batch)
+                
                 self.save_checkpoint(epoch, self.global_step)
                 if self.validation_sampler and self.validation_sampler.should_run_validation(self.global_step):
                     self.fps_logger.pause()
@@ -412,8 +551,18 @@ class BaseTrainer(ABC):
         self.num_epochs = int(self.config.train.max_train_steps / self.batch_size / self.accelerator.num_processes)
 
     def update_progressbar(self, logs: dict):
-        self.accelerator.log(logs, step=self.global_step)
-        logs = {
+        # Log to wandb/tensorboard with clean names
+        tracker_logs = {
+            "train/loss": logs["loss"],
+            "train/smooth_loss": logs["smooth_loss"],
+            "train/learning_rate": logs["lr"],
+            "train/epoch": logs["epoch"],
+            "train/fps": logs["fps"],
+        }
+        self.accelerator.log(tracker_logs, step=self.global_step)
+        
+        # Format for progress bar display
+        display_logs = {
             "loss": f"{logs['loss']:.3f}",
             "smooth_loss": f"{logs['smooth_loss']:.3f}",
             "lr": f"{logs['lr']:.1e}",
@@ -422,7 +571,7 @@ class BaseTrainer(ABC):
         }
         self.progress_bar.update(1)
         self.global_step += 1
-        self.progress_bar.set_postfix(logs)
+        self.progress_bar.set_postfix(display_logs)
 
     def fit(self, train_dataloader):
         """Main training loop implementation."""
@@ -564,15 +713,56 @@ class BaseTrainer(ABC):
             project_config=accelerator_project_config,
         )
 
-        # Initialize tracker with empty project name to avoid subdirectory
-        if self.config.logging.report_to == "tensorboard":
+        # Initialize tracker
+        if self.config.logging.report_to == "wandb":
+            # Create comprehensive config for wandb
+            try:
+                import wandb
+                
+                wandb_config = {
+                    "learning_rate": float(self.config.optimizer.init_args.get("lr", 0.0001)),
+                    "batch_size": int(self.config.data.batch_size),
+                    "max_train_steps": int(self.config.train.max_train_steps),
+                    "gradient_accumulation_steps": int(self.config.train.gradient_accumulation_steps),
+                    "mixed_precision": str(self.config.train.mixed_precision),
+                    "lora_r": int(self.config.model.lora.r),
+                    "lora_alpha": int(self.config.model.lora.lora_alpha),
+                    "model_name": str(self.config.model.pretrained_model_name_or_path),
+                    "checkpointing_steps": int(self.config.train.checkpointing_steps),
+                    "max_grad_norm": float(self.config.train.max_grad_norm),
+                    "mask_loss": bool(self.config.loss.mask_loss),
+                    "use_cache": bool(self.config.cache.use_cache),
+                }
+                
+                # Prepare wandb init kwargs (don't include 'project' - accelerator handles it via project_name)
+                init_kwargs = {}
+                
+                # Add optional wandb-specific fields
+                if hasattr(self.config.logging, 'wandb_entity') and self.config.logging.wandb_entity:
+                    init_kwargs["entity"] = self.config.logging.wandb_entity
+                if hasattr(self.config.logging, 'wandb_tags') and self.config.logging.wandb_tags:
+                    init_kwargs["tags"] = self.config.logging.wandb_tags
+                if hasattr(self.config.logging, 'wandb_notes') and self.config.logging.wandb_notes:
+                    init_kwargs["notes"] = self.config.logging.wandb_notes
+                
+                self.accelerator.init_trackers(
+                    project_name=self.config.logging.tracker_project_name,
+                    config=wandb_config,
+                    init_kwargs={"wandb": init_kwargs}
+                )
+                
+                logging.info("Initialized wandb tracker successfully")
+            except Exception as e:
+                logging.warning(f"Failed to initialize wandb tracker: {e}")
+                # Initialize without extra config if there's an error
+                self.accelerator.init_trackers(self.config.logging.tracker_project_name)
+        elif self.config.logging.report_to == "tensorboard":
             # Create a simple config dict with only basic types for TensorBoard
             try:
                 simple_config = {
                     "learning_rate": float(self.config.optimizer.init_args.get("lr", 0.0001)),
                     "batch_size": int(self.config.data.batch_size),
                     "max_train_steps": int(self.config.train.max_train_steps),
-                    "num_epochs": int(self.config.train.num_epochs),
                     "gradient_accumulation_steps": int(self.config.train.gradient_accumulation_steps),
                     "mixed_precision": str(self.config.train.mixed_precision),
                     "lora_r": int(self.config.model.lora.r),

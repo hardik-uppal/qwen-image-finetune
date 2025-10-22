@@ -593,8 +593,9 @@ class QwenImageEditTrainer(BaseTrainer):
         control_latents = embeddings["control_latents"].to(self.weight_dtype).to(device)
         prompt_embeds = embeddings["prompt_embeds"].to(self.weight_dtype).to(device)
         prompt_embeds_mask = embeddings["prompt_embeds_mask"].to(dtype=torch.int64).to(device)
-        img_shapes = embeddings["img_shapes"]  # must from the cache embeddings
         batch_size = image_latents.shape[0]
+        # Compute img_shapes from embeddings
+        img_shapes = self._get_image_shapes(embeddings, batch_size)
         if "mask" in embeddings:
             edit_mask = embeddings["mask"]
         else:
@@ -612,6 +613,8 @@ class QwenImageEditTrainer(BaseTrainer):
                 mode_scale=1.29,
             )
             indices = (u * self.scheduler.config.num_train_timesteps).long()
+            # Clamp indices to valid range to prevent out-of-bounds access when u = 1.0
+            indices = torch.clamp(indices, 0, len(self.scheduler.timesteps) - 1)
             timesteps = self.scheduler.timesteps[indices].to(device=device)
 
             sigmas = self._get_sigmas(timesteps, n_dim=image_latents.ndim, dtype=image_latents.dtype)
@@ -633,16 +636,63 @@ class QwenImageEditTrainer(BaseTrainer):
         weighting = compute_loss_weighting_for_sd3(weighting_scheme="none", sigmas=sigmas)
         target = noise - image_latents
         # pred shape [2, 4104, 64], target shape [2, 4104, 64]
-        loss = self.forward_loss(model_pred, target, weighting, edit_mask)
-        return loss
+        loss_result = self.forward_loss(model_pred, target, weighting, edit_mask)
+        
+        # Log timestep statistics
+        if self.accelerator.is_main_process and self.global_step % 10 == 0:
+            timestep_metrics = {
+                'training/timestep_mean': timesteps.float().mean().item(),
+                'training/timestep_std': timesteps.float().std().item(),
+            }
+            self.accelerator.log(timestep_metrics, step=self.global_step)
+        
+        # Log mask loss breakdown if available
+        if isinstance(loss_result, dict):
+            if self.accelerator.is_main_process:
+                mask_metrics = {}
+                if 'fg_loss' in loss_result:
+                    mask_metrics['loss/foreground'] = loss_result['fg_loss'].item()
+                if 'bg_loss' in loss_result:
+                    mask_metrics['loss/background'] = loss_result['bg_loss'].item()
+                if 'mask_coverage' in loss_result:
+                    mask_metrics['loss/mask_coverage'] = loss_result['mask_coverage'].item()
+                
+                if mask_metrics:
+                    self.accelerator.log(mask_metrics, step=self.global_step)
+            
+            # Return the actual loss for backprop
+            return loss_result['total_loss']
+        
+        return loss_result
 
     def _get_sigmas(self, timesteps, n_dim=4, dtype=torch.float32):
-        """Calculate sigma values for noise scheduler"""
+        """Calculate sigma values for noise scheduler
+        
+        Uses nearest-neighbor matching on CPU to handle cases where sampled timesteps
+        don't exist exactly in the scheduler's timestep array. This avoids CUDA
+        assertion errors from index operations.
+        """
         noise_scheduler_copy = copy.deepcopy(self.scheduler)
         sigmas = noise_scheduler_copy.sigmas.to(device=self.accelerator.device, dtype=dtype)
-        schedule_timesteps = noise_scheduler_copy.timesteps.to(self.accelerator.device)
-        timesteps = timesteps.to(self.accelerator.device)
-        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+        schedule_timesteps = noise_scheduler_copy.timesteps
+        
+        # Move to CPU for safe comparison operations (avoid CUDA assertions)
+        schedule_timesteps_cpu = schedule_timesteps.cpu().float()
+        timesteps_cpu = timesteps.cpu().float()
+        
+        # Debug: Log timestep ranges to diagnose out-of-bounds issues
+        if self.accelerator.is_main_process and self.global_step % 100 == 0:
+            logging.info(f"Timestep sampling - min: {timesteps_cpu.min().item():.1f}, max: {timesteps_cpu.max().item():.1f}, "
+                        f"scheduler range: [{schedule_timesteps_cpu.min().item():.1f}, {schedule_timesteps_cpu.max().item():.1f}]")
+        
+        # Use nearest-neighbor matching on CPU (safer than CUDA for edge cases)
+        step_indices = []
+        for t in timesteps_cpu:
+            # Find the closest timestep in the schedule
+            distances = torch.abs(schedule_timesteps_cpu - t)
+            nearest_idx = torch.argmin(distances).item()
+            step_indices.append(nearest_idx)
+        
         sigma = sigmas[step_indices].flatten()
         while len(sigma.shape) < n_dim:
             sigma = sigma.unsqueeze(-1)
@@ -775,6 +825,78 @@ class QwenImageEditTrainer(BaseTrainer):
         prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
 
         return prompt_embeds, encoder_attention_mask
+    
+    def encode_vae_image_for_validation(self, control_image):
+        """Encode control image for validation caching
+        Args:
+            control_image: numpy array [C,H,W] in range [0, 255]
+        Returns:
+            dict with control_latents and shape info
+        """
+        import torch
+        import numpy as np
+        
+        # Convert numpy to tensor and preprocess
+        if isinstance(control_image, np.ndarray):
+            control = torch.from_numpy(control_image).unsqueeze(0)  # Add batch dim [1,C,H,W]
+        else:
+            control = control_image
+        
+        # Preprocess for VAE encoder
+        control = self.preprocess_image_for_vae_encoder(control)  # [1,C,1,H,W] in [-1,1]
+        
+        # Get latents
+        batch_size = 1
+        height_control, width_control = control.shape[3], control.shape[4]
+        _, control_latents = self.prepare_latents(
+            control,
+            batch_size,
+            self.num_channels_latents,
+            height_control,
+            width_control,
+            self.weight_dtype,
+        )
+        
+        return {
+            "control_latents": control_latents,
+            "height_control": height_control,
+            "width_control": width_control,
+            "height": height_control,  # Default target size same as control
+            "width": width_control,
+            "n_controls": 0,  # No additional controls for validation
+            "num_inference_steps": 20,  # Default for validation
+            "true_cfg_scale": 1.0,  # No CFG for validation by default
+            "guidance": 1.0,
+        }
+    
+    def encode_prompt_for_validation(self, prompt, control_image):
+        """Encode prompt with control image for validation caching
+        Args:
+            prompt: str
+            control_image: numpy array [C,H,W] in range [0, 255]
+        Returns:
+            dict with prompt embeddings
+        """
+        import numpy as np
+        
+        # Preprocess control image for text encoder
+        if isinstance(control_image, np.ndarray):
+            control = torch.from_numpy(control_image).unsqueeze(0)  # [1,C,H,W]
+        else:
+            control = control_image
+        
+        prompt_control = self.preprocess_image_for_text_encoder(control, best_resolution=384 * 384)
+        
+        # Encode prompt with image
+        prompt_embeds, prompt_embeds_mask = self.encode_prompt(
+            prompt=[prompt] if isinstance(prompt, str) else prompt,
+            image=prompt_control,
+        )
+        
+        return {
+            "prompt_embeds": prompt_embeds,
+            "prompt_embeds_mask": prompt_embeds_mask,
+        }
 
     def prepare_predict_batch_data(
         self,
@@ -1051,8 +1173,27 @@ class QwenImageEditTrainer(BaseTrainer):
         return latents
 
     def decode_vae_latent(self, latents: torch.Tensor, height: int, width: int) -> torch.Tensor:
-        # 8. decode final latents
-        latents = latents.to(self.vae.device, dtype=self.weight_dtype)
+        """Decode VAE latents to images
+        
+        Handles device mismatches by temporarily moving VAE to the same device as latents.
+        """
+        # Save original VAE device for restoration later
+        original_vae_device = next(self.vae.parameters()).device
+        original_decoder_device = next(self.vae.decoder.parameters()).device
+        target_device = latents.device
+        
+        # Move VAE to the same device as latents if needed
+        if original_vae_device != target_device:
+            logging.info(f"Moving VAE from {original_vae_device} to {target_device} for decoding")
+            self.vae.to(target_device)
+        
+        # Explicitly move decoder (it may have been moved to CPU separately during training)
+        if original_decoder_device != target_device:
+            logging.info(f"Moving VAE decoder from {original_decoder_device} to {target_device}")
+            self.vae.decoder.to(target_device)
+        
+        # Prepare latents
+        latents = latents.to(target_device, dtype=self.weight_dtype)
         latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
         latents_mean = (
             torch.tensor(self.vae.config.latents_mean)
@@ -1063,8 +1204,22 @@ class QwenImageEditTrainer(BaseTrainer):
             latents.device, latents.dtype
         )
         latents = latents / latents_std + latents_mean
+        
+        # Decode
         final_image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
+        
+        # Move VAE back to original device to save memory
+        if original_vae_device != target_device:
+            logging.info(f"Moving VAE back to {original_vae_device}")
+            self.vae.to(original_vae_device)
+        
+        # Move decoder back to original device
+        if original_decoder_device != target_device:
+            logging.info(f"Moving VAE decoder back to {original_decoder_device}")
+            self.vae.decoder.to(original_decoder_device)
+            
+        torch.cuda.empty_cache()  # Clear CUDA cache
 
-        # 后处理
+        # Post-process
         final_image = self.image_processor.postprocess(final_image, output_type="pt")
         return final_image

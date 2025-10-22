@@ -11,6 +11,7 @@ import importlib
 import logging
 import random
 import pandas as pd
+import PIL.Image
 
 from src.data.cache_manager import EmbeddingCacheManager
 from src.utils.huggingface import load_editing_dataset, is_huggingface_repo
@@ -147,6 +148,11 @@ class ImageDataset(Dataset):
         self.cache_dir = data_config.cache_dir
         self.use_cache = data_config.use_cache
         self.selected_control_indexes = data_config.selected_control_indexes
+        
+        # Image filtering parameters
+        self.max_image_dimension = getattr(data_config, 'max_image_dimension', None)
+        self.max_file_size_mb = getattr(data_config, 'max_file_size_mb', None)
+        self.skip_on_error = getattr(data_config, 'skip_on_error', True)
 
         if self.use_cache and self.cache_dir:
             os.makedirs(self.cache_dir, exist_ok=True)
@@ -196,6 +202,32 @@ class ImageDataset(Dataset):
     def __len__(self):
         """Return total number of samples across all datasets."""
         return len(self.all_samples)
+    
+    def _is_image_valid(self, image_path: str) -> bool:
+        """Check if image is safe to load based on file size and dimensions."""
+        try:
+            # Check file size first (fastest check)
+            if self.max_file_size_mb:
+                file_size_mb = os.path.getsize(image_path) / (1024 * 1024)
+                if file_size_mb > self.max_file_size_mb:
+                    logging.warning(f"Skipping {image_path}: {file_size_mb:.1f}MB > {self.max_file_size_mb}MB")
+                    return False
+            
+            # Check dimensions without loading full image (only reads header)
+            if self.max_image_dimension:
+                with PIL.Image.open(image_path) as img:
+                    w, h = img.size
+                    if w > self.max_image_dimension or h > self.max_image_dimension:
+                        logging.warning(f"Skipping {image_path}: {w}x{h} exceeds {self.max_image_dimension}")
+                        return False
+            
+            return True
+        except Exception as e:
+            if self.skip_on_error:
+                logging.warning(f"Error validating {image_path}: {e}")
+                return False
+            else:
+                raise
 
     def _load_huggingface_dataset(self, repo_id: str, split: Optional[str] = None):
         """
@@ -263,7 +295,8 @@ class ImageDataset(Dataset):
         control_keys = sorted(columns)
         samples = []
         for idx, row in df.iterrows():
-            controls = [row[x] for x in control_keys]
+            # Filter out NaN values from controls (empty CSV cells become NaN)
+            controls = [row[x] for x in control_keys if pd.notna(row[x])]
             prompt = row["prompt"]
             data = {
                 "image": row["path_target"],
@@ -469,7 +502,18 @@ class ImageDataset(Dataset):
                     data['controls'] = control[1:]
                     data['controls'] = [img.convert('RGB') for img in data['controls']]
                     if self.selected_control_indexes is not None:
-                        data['controls'] = [data['controls'][i-1] for i in self.selected_control_indexes]
+                        # Only select indexes that exist in the controls list
+                        valid_controls = []
+                        for i in self.selected_control_indexes:
+                            if i-1 < len(data['controls']):
+                                valid_controls.append(data['controls'][i-1])
+                            else:
+                                logging.warning(f"Control index {i} not found in sample {local_index}, skipping")
+                        data['controls'] = valid_controls if valid_controls else None
+                        # Remove controls key if empty
+                        if data['controls'] is None or len(data['controls']) == 0:
+                            if 'controls' in data:
+                                del data['controls']
 
             prompt = data_item['prompt']
             data['prompt'] = prompt
@@ -491,6 +535,25 @@ class ImageDataset(Dataset):
             #         "global_index": start_idx + n,
             #     }
             # ) If, not exist return None
+            # Validate images before processing
+            if self.skip_on_error:
+                # Check target image
+                if self.data_key_exist(data_item, 'image'):
+                    if not self._is_image_valid(data_item['image']):
+                        # Skip to next sample
+                        return self.load_data((idx + 1) % len(self))
+                
+                # Check control images
+                if self.data_key_exist(data_item, 'control') and isinstance(data_item['control'], list):
+                    valid_controls = []
+                    for control_path in data_item['control']:
+                        if isinstance(control_path, str) and self._is_image_valid(control_path):
+                            valid_controls.append(control_path)
+                    if not valid_controls:
+                        # No valid control images, skip to next sample
+                        return self.load_data((idx + 1) % len(self))
+                    data_item['control'] = valid_controls
+            
             # 读取提示文本
             if self.data_key_exist(data_item, 'image'):
                 data['image'] = data_item['image']
@@ -499,7 +562,18 @@ class ImageDataset(Dataset):
                 if len(data_item['control']) > 1:
                     data['controls'] = data_item['control'][1:]
                     if self.selected_control_indexes is not None:
-                        data['controls'] = [data['controls'][i-1] for i in self.selected_control_indexes]
+                        # Only select indexes that exist in the controls list
+                        valid_controls = []
+                        for i in self.selected_control_indexes:
+                            if i-1 < len(data['controls']):
+                                valid_controls.append(data['controls'][i-1])
+                            else:
+                                logging.warning(f"Control index {i} not found in sample {idx}, skipping")
+                        data['controls'] = valid_controls if valid_controls else None
+                        # Remove controls key if empty
+                        if data['controls'] is None or len(data['controls']) == 0:
+                            if 'controls' in data:
+                                del data['controls']
             if self.data_key_exist(data_item, 'mask_file'):
                 data['mask'] = cv2.imread(data_item['mask_file'], 0)
             if self.data_key_exist(data_item, 'caption') and data_item['dataset_type'] == 'local':
@@ -528,26 +602,33 @@ class ImageDataset(Dataset):
         prompt = item['prompt']   # str
         ```
         """
-        data = self.load_data(idx)
-        data = self.preprocessor.preprocess(data)
-        data['cached'] = False
-        if self.use_cache and self.cache_exists:
-            if random.random() < self.data_config.caption_dropout_rate:
-                replace_empty_embeddings = True
+        try:
+            data = self.load_data(idx)
+            data = self.preprocessor.preprocess(data)
+            data['cached'] = False
+            if self.use_cache and self.cache_exists:
+                if random.random() < self.data_config.caption_dropout_rate:
+                    replace_empty_embeddings = True
+                else:
+                    replace_empty_embeddings = False
+                prompt_empty_drop_keys = self.data_config.prompt_empty_drop_keys
+                data = self.cache_manager.load_cache(data, replace_empty_embeddings, prompt_empty_drop_keys)
+                data['cached'] = True
+            if 'controls' in data:
+                n_controls = len(data['controls'])
+                for i in range(n_controls):
+                    data[f'control_{i+1}'] = data['controls'][i]
+                del data['controls']
+                data['n_controls'] = n_controls
             else:
-                replace_empty_embeddings = False
-            prompt_empty_drop_keys = self.data_config.prompt_empty_drop_keys
-            data = self.cache_manager.load_cache(data, replace_empty_embeddings, prompt_empty_drop_keys)
-            data['cached'] = True
-        if 'controls' in data:
-            n_controls = len(data['controls'])
-            for i in range(n_controls):
-                data[f'control_{i+1}'] = data['controls'][i]
-            del data['controls']
-            data['n_controls'] = n_controls
-        else:
-            data['n_controls'] = 0
-        return data
+                data['n_controls'] = 0
+            return data
+        except Exception as e:
+            if self.skip_on_error:
+                logging.warning(f"Error loading sample {idx}: {e}, skipping to next sample...")
+                return self.__getitem__((idx + 1) % len(self))
+            else:
+                raise
 
 
 def pad_to_max_shape(tensors, padding_value=0):
@@ -595,9 +676,25 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     # [{a:1,b:2, c:{d:1,g:2}},{a:3,b:4, c:{e:3,g:4}}] -> {a: [1,3], b: [2,4], c:{d: [1,3], e: [2,4], g: [2,4]}}
     # 分离cached和non-cached的数据
-    keys = list(batch[0].keys())
-    # flattten
-    batch_dict = {key: [item[key] for item in batch] for key in keys}
+    # Collect all unique keys from all items (some samples may not have all keys like control_1, control_2, etc.)
+    all_keys = set()
+    for item in batch:
+        all_keys.update(item.keys())
+    keys = list(all_keys)
+    
+    # flattten - only include items that have the key
+    batch_dict = {}
+    for key in keys:
+        values = [item[key] for item in batch if key in item]
+        # Skip keys that don't exist in any item or have inconsistent presence
+        if len(values) == len(batch):
+            # All items have this key
+            batch_dict[key] = values
+        elif len(values) > 0:
+            # Some items have this key - pad with None or skip based on type
+            # For now, only include if all items have it to avoid shape mismatches
+            # This handles control_1, control_2 etc. which may not be in all samples
+            continue
     # if torch tensor, padding to maximal length
     for key in batch_dict:
         if isinstance(batch_dict[key][0], np.ndarray):

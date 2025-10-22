@@ -1,6 +1,6 @@
 safetensors
 diffusers
-transformers==4.52.4
+transformers
 pyyaml
 oyaml
 tensorboard
@@ -20,7 +20,7 @@ ipykernel
 # optimum
 optimum-quanto
 bitsandbytes
-transformer_engine[pytorch]
+# transformer_engine[pytorch]
 packaging
 ninja
 wheel
@@ -32,3 +32,4 @@ pydantic==2.11.7
 blake3
 pillow
 rich
+imagehash

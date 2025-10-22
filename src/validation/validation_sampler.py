@@ -8,7 +8,7 @@ import torch
 from torch.utils.data import ConcatDataset
 from torch.utils.data import Dataset
 from accelerate import Accelerator
-from src.data.config import ValidationDataConfig
+from src.data.config import SamplingConfig
 from src.data.config import DataConfig
 import math
 import cv2
@@ -25,7 +25,7 @@ class ValidationSampler:
 
     def __init__(
         self,
-        config: ValidationDataConfig,
+        config: SamplingConfig,
         accelerator: Accelerator,
         weight_dtype: torch.dtype = torch.bfloat16,
         data_config: DataConfig | None = None,
@@ -120,13 +120,33 @@ class ValidationSampler:
             self.selected_datasets.append(data_item)
 
     def _load_dataset_from_path(self, dataset_path: str):
-        """Load validation dataset from file path"""
+        """Load validation dataset from file path
+        
+        For validation visualization, we want to load raw images without heavy preprocessing
+        to show actual input/output quality, not cropped training data.
+        """
         assert (
             self.data_config is not None
         ), "data_config is required to instantiated dataset class"
-        init_args = self.data_config.init_args
-        init_args["dataset_path"] = dataset_path
-        dataset = ImageDataset(init_args)
+        
+        # Create a copy of init_args with updated dataset_path and minimal preprocessing
+        init_args_dict = self.data_config.init_args.model_dump()
+        init_args_dict["dataset_path"] = [dataset_path]  # dataset_path expects a list
+        
+        # For validation visualization, disable aggressive cropping
+        # Use the actual image sizes or resize to reasonable size while maintaining aspect ratio
+        if "processor" in init_args_dict and init_args_dict["processor"]:
+            processor_dict = init_args_dict["processor"]["init_args"]
+            # Change from center_crop to resize to preserve full image
+            processor_dict["process_type"] = "resize"  # Don't crop for validation visualization
+            # Keep target size reasonable but allow full image
+            # processor_dict["target_size"] = [768, 768]  # Larger size for better visualization
+        
+        # Reconstruct the init args object
+        from src.data.config import DatasetInitArgs
+        updated_init_args = DatasetInitArgs(**init_args_dict)
+        
+        dataset = ImageDataset(updated_init_args)
         return self._create_subset_from_training(dataset)
 
     def _create_dataset_from_pairs(self, pairs: List[Dict]):
@@ -154,13 +174,16 @@ class ValidationSampler:
         """Cache embeddings for all validation samples using trainer's methods"""
         self.cached_embeddings = []
         for idx, sample in enumerate(self.selected_datasets):
-            cached_sample = {"sample_idx": idx}
-            cached_sample["control_latents"] = trainer.encode_vae_image_for_validation(
-                sample["control"]
-            )
-            cached_sample["text_embeddings"] = trainer.encode_prompt_for_validation(
-                sample["prompt"], sample["control"]
-            )
+            # Get VAE and text encodings separately
+            vae_encodings = trainer.encode_vae_image_for_validation(sample["control"])
+            text_encodings = trainer.encode_prompt_for_validation(sample["prompt"], sample["control"])
+            
+            # Merge into a single dict for sampling_from_embeddings
+            cached_sample = {
+                "sample_idx": idx,
+                **vae_encodings,  # Unpacks control_latents, height, width, etc.
+                **text_encodings,  # Unpacks prompt_embeds, prompt_embeds_mask
+            }
             self.cached_embeddings.append(cached_sample)
         logging.info(
             f"rank [{self.local_rank}] Successfully cached embeddings for "
@@ -182,33 +205,100 @@ class ValidationSampler:
             )
             return
 
+        logger.info(f"Starting validation at step {global_step} with {len(self.cached_embeddings)} samples")
+        
         try:
             # Sample from cached embeddings
-            for data, cache_embedding in zip(
+            for idx, (data, cache_embedding) in enumerate(zip(
                 self.selected_datasets, self.cached_embeddings
-            ):
+            )):
                 prompt = data["prompt"]
-                control = data["control"]  # C,H,W [0,222] np.ndarray
-                control = torch.from_numpy(control).unsqueeze(0)
-                control = (control - 127.5) / 255
+                control = data["control"]  # Can be np.ndarray or Tensor
+                
+                # Handle both numpy arrays and tensors
+                if isinstance(control, torch.Tensor):
+                    if control.dim() == 3:  # [C,H,W]
+                        control = control.unsqueeze(0)  # Add batch dim -> [1,C,H,W]
+                else:
+                    control = torch.from_numpy(control).unsqueeze(0)
+                
+                # Normalize to [-1, 1] range for log_images_auto
+                control = control.float()
+                
+                # Detect range and normalize appropriately
+                min_val, max_val = control.min(), control.max()
+                logger.info(f"Control image {idx+1} shape: {control.shape}, range: [{min_val:.3f}, {max_val:.3f}]")
+                
+                if max_val > 10.0:  # Definitely in [0, 255] range
+                    control = (control / 255.0) * 2 - 1  # [0, 255] -> [-1, 1]
+                    logger.info(f"Normalized from [0, 255] range")
+                elif min_val >= 0 and max_val <= 1.0:  # Already in [0, 1] range
+                    control = control * 2 - 1  # [0, 1] -> [-1, 1]
+                    logger.info(f"Normalized from [0, 1] range")
+                else:
+                    logger.info(f"Keeping as-is (assumed [-1, 1] range)")
+                
+                logger.info(f"Logging control image {idx+1}/{len(self.cached_embeddings)}")
                 log_images_auto(
                     self.accelerator,
-                    f"control_{self.local_rank}",
+                    f"validation/control_{self.local_rank}_sample{idx}",
                     control,
                     global_step,
                     caption=prompt,
                 )
+                
+                # Log target/ground truth image if available
+                if "image" in data:
+                    target = data["image"]
+                    # Handle tensor/numpy conversion
+                    if isinstance(target, torch.Tensor):
+                        if target.dim() == 3:
+                            target = target.unsqueeze(0)
+                    else:
+                        target = torch.from_numpy(target).unsqueeze(0)
+                    
+                    # Normalize target image
+                    target = target.float()
+                    target_min, target_max = target.min(), target.max()
+                    logger.info(f"Target image {idx+1} shape: {target.shape}, range: [{target_min:.3f}, {target_max:.3f}]")
+                    
+                    if target_max > 10.0:
+                        target = (target / 255.0) * 2 - 1
+                    elif target_min >= 0 and target_max <= 1.0:
+                        target = target * 2 - 1
+                    
+                    logger.info(f"Logging target/ground truth image {idx+1}/{len(self.cached_embeddings)}")
+                    log_images_auto(
+                        self.accelerator,
+                        f"validation/target_{self.local_rank}_sample{idx}",
+                        target,
+                        global_step,
+                        caption=f"GT: {prompt}",
+                    )
+                
                 # Generate sample using cached embeddings and trainer's model
-                generated_image = trainer.sampling_from_embeddings(cache_embedding)
+                logger.info(f"Generating image {idx+1}/{len(self.cached_embeddings)}")
+                generated_latents = trainer.sampling_from_embeddings(cache_embedding)
+                
+                # Decode latents to images
+                logger.info(f"Decoding latents to image {idx+1}/{len(self.cached_embeddings)}")
+                height = cache_embedding.get("height", 832)
+                width = cache_embedding.get("width", 576)
+                generated_image = trainer.decode_vae_latent(generated_latents, height, width)
+                
+                logger.info(f"Generated image shape: {generated_image.shape}, range: [{generated_image.min():.3f}, {generated_image.max():.3f}]")
+                logger.info(f"Logging generated image {idx+1}/{len(self.cached_embeddings)}")
                 log_images_auto(
                     self.accelerator,
-                    f"generated_image_{self.local_rank}",
+                    f"validation/generated_{self.local_rank}_sample{idx}",
                     generated_image,
                     global_step,
-                    caption=prompt,
+                    caption=f"Pred: {prompt}",
                 )
+            
+            logger.info(f"Validation complete at step {global_step}")
 
         except Exception as e:
-            logger.error(f"Validation sampling failed at step {global_step}: {e}")
+            logger.error(f"Validation sampling failed at step {global_step}: {e}", exc_info=True)
             if not self._internal_config["skip_on_error"]:
                 raise

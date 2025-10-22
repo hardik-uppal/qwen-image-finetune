@@ -129,7 +129,9 @@ class QwenImageEditPlusTrainer(QwenImageEditTrainer):
         if "control" in batch:
             control_image = batch["control"]
             prompt_control = self.preprocess_image_for_text_encoder(control_image, best_resolution=384 * 384)  # [B,C,H,W], uint8, range [0,255]
-            condition_images.append(prompt_control[0])  # remove batch dim
+            # Store all batch items instead of just [0]
+            for b in range(prompt_control.shape[0]):
+                condition_images.append([prompt_control[b]])  # Each batch item gets its own list of condition images
             batch["control"] = self.preprocess_image_for_vae_encoder(
                 batch["control"]
             )  # [B,C,1,H,W], float, range [-1,1]
@@ -147,13 +149,22 @@ class QwenImageEditPlusTrainer(QwenImageEditTrainer):
                 # condition_images =
                 additional_control_image = batch[additional_control_key]
                 prompt_control = self.preprocess_image_for_text_encoder(additional_control_image, best_resolution=384 * 384)  # [B,C,H,W], uint8, range [0,255]
-                condition_images.append(prompt_control[0])  # remove batch dim
+                # Append to each batch item's condition images list
+                for b in range(prompt_control.shape[0]):
+                    condition_images[b].append(prompt_control[b])
                 batch[additional_control_key] = self.preprocess_image_for_vae_encoder(batch[additional_control_key])
                 batch[f"width_control_{i+1}"] = batch[additional_control_key].shape[4]
                 batch[f"height_control_{i+1}"] = batch[additional_control_key].shape[3]
+        
+        # Flatten condition_images: [[img1_b0], [img1_b1]] if no additional controls, or [[img1_b0, img2_b0], [img1_b1, img2_b1]] if additional controls exist
+        # For Qwen processor, we need to pass all images for all batch items
+        # But the current implementation expects one set of images shared across batch
+        # So we take only the first batch item's images (consistent with original behavior for now)
+        condition_images_for_encoding = condition_images[0] if len(condition_images) > 0 else []
+        
         prompt_embeds, prompt_embeds_mask = self.encode_prompt(
             prompt=batch["prompt"],
-            image=condition_images,
+            image=condition_images_for_encoding,
         )
         batch["prompt_embeds_mask"] = prompt_embeds_mask
         batch["prompt_embeds"] = prompt_embeds
@@ -161,7 +172,7 @@ class QwenImageEditPlusTrainer(QwenImageEditTrainer):
         if stage == "cache":
             empty_prompt_embeds, empty_prompt_embeds_mask = self.encode_prompt(
                 prompt=[""],
-                image=condition_images,
+                image=condition_images_for_encoding,
             )
             batch["empty_prompt_embeds_mask"] = empty_prompt_embeds_mask
             batch["empty_prompt_embeds"] = empty_prompt_embeds
@@ -170,7 +181,7 @@ class QwenImageEditPlusTrainer(QwenImageEditTrainer):
             # only for predict stage
             negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
                 prompt=batch["negative_prompt"],
-                image=condition_images,
+                image=condition_images_for_encoding,
             )
             batch["negative_prompt_embeds_mask"] = negative_prompt_embeds_mask
             batch["negative_prompt_embeds"] = negative_prompt_embeds
@@ -206,6 +217,9 @@ class QwenImageEditPlusTrainer(QwenImageEditTrainer):
 
         for i in range(1, num_additional_controls + 1):
             control_key = f"control_{i}"
+            # Only process if the key actually exists in the batch (collate_fn may have filtered it out)
+            if control_key not in batch:
+                continue
             control = batch[control_key]
             batch_size = control.shape[0]
             height_control, width_control = batch[f"height_control_{i}"], batch[f"width_control_{i}"]
@@ -283,6 +297,8 @@ class QwenImageEditPlusTrainer(QwenImageEditTrainer):
         dtype: Optional[torch.dtype] = None,
     ):
         prompt = [prompt] if isinstance(prompt, str) else prompt
+        batch_size = len(prompt)
+        
         img_prompt_template = "Picture {}: <|vision_start|><|image_pad|><|vision_end|>"
         if isinstance(image, list):
             base_img_prompt = ""
@@ -297,9 +313,18 @@ class QwenImageEditPlusTrainer(QwenImageEditTrainer):
 
         drop_idx = self.prompt_template_encode_start_idx
         txt = [template.format(base_img_prompt + e) for e in prompt]
+        
+        # Qwen processor expects images list to match batch size
+        # If we have batch_size=2 and 1 set of condition images, we need to duplicate them
+        if image is not None and isinstance(image, list):
+            # Replicate the images for each batch item: [img1] * 2 = [img1, img1]
+            images_for_processor = image * batch_size
+        else:
+            images_for_processor = image
+        
         model_inputs = self.processor(
             text=txt,
-            images=image,
+            images=images_for_processor,
             padding=True,
             return_tensors="pt",
         ).to(device)

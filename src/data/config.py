@@ -271,6 +271,10 @@ class DatasetInitArgs(BaseModel):
     selected_control_indexes: Optional[List[int]] = None
     prompt_empty_drop_keys: Optional[List[str]] = None
     processor: ImageProcessorConfig = Field(default_factory=ImageProcessorConfig)
+    # Image filtering parameters for runtime validation
+    max_image_dimension: Optional[int] = None  # Skip images wider or taller than this
+    max_file_size_mb: Optional[float] = None   # Skip image files larger than this MB
+    skip_on_error: bool = True                  # Skip problematic images instead of crashing
 
 
 class DataConfig(BaseModel):
@@ -346,6 +350,17 @@ class LoggingConfig(BaseModel):
     report_to: str = "tensorboard"  # tensorboard, wandb, all, none
     tracker_project_name: Optional[str] = None  # will get the value from trainer
     sampling: SamplingConfig = Field(default_factory=SamplingConfig)
+    
+    # Wandb-specific configuration
+    wandb_entity: Optional[str] = None  # wandb username or team name
+    wandb_tags: Optional[List[str]] = None  # tags for organizing runs
+    wandb_notes: Optional[str] = None  # run description
+    
+    # Enhanced metrics logging
+    log_gradients: bool = True  # enable gradient norm logging
+    log_parameters: bool = True  # enable parameter statistics logging
+    log_memory: bool = True  # enable memory usage tracking
+    enhanced_metrics_interval: int = 10  # log enhanced metrics every N steps
 
     @field_validator("report_to")
     @classmethod
@@ -359,6 +374,13 @@ class LoggingConfig(BaseModel):
     @classmethod
     def _check_output_dir(cls, v: str) -> str:
         return _normalize_cache_dir(v)
+    
+    @field_validator("enhanced_metrics_interval")
+    @classmethod
+    def _check_positive_interval(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("enhanced_metrics_interval must be positive")
+        return v
 
 
 # ----------------------------
