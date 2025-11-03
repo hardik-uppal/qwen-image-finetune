@@ -96,7 +96,8 @@ target/
 # IPython
 profile_default/
 ipython_config.py
-
+# flash attention
+flash-attention/
 # workspace
 workspace/
 wandb/

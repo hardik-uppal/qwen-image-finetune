@@ -52,6 +52,127 @@ def log_images_auto(accelerator, tag, images, step, caption=None, nrow=4, max_im
         accelerator.log({f"{tag}/num_images": int(t.shape[0])}, step=step)
 
 
+def log_comparison_images(
+    accelerator, 
+    tag, 
+    control_images, 
+    generated_images, 
+    step, 
+    target_images=None,
+    caption=None, 
+    padding=4
+):
+    """
+    Log control, target (optional), and generated images side by side for easy comparison.
+    
+    Args:
+        accelerator: Accelerator instance
+        tag: Logging tag
+        control_images: Tensor [B,C,H,W] in [-1,1]
+        generated_images: Tensor [B,C,H,W] in [-1,1]
+        target_images: Optional tensor [B,C,H,W] in [-1,1]
+        step: Current training step
+        caption: Optional caption for the image
+        padding: Padding between images
+    """
+    if not accelerator.is_main_process:
+        return
+    
+    # Convert all images to [0,1] range
+    control = (control_images.detach().float() + 1) / 2
+    control = control.clamp(0, 1).cpu()
+    
+    generated = (generated_images.detach().float() + 1) / 2
+    generated = generated.clamp(0, 1).cpu()
+    
+    # Prepare list of image tensors to concatenate
+    images_to_concat = [control]
+    
+    if target_images is not None:
+        target = (target_images.detach().float() + 1) / 2
+        target = target.clamp(0, 1).cpu()
+        images_to_concat.append(target)
+    
+    images_to_concat.append(generated)
+    
+    # Concatenate horizontally for each sample in batch
+    batch_size = control.shape[0]
+    concatenated_rows = []
+    
+    for i in range(batch_size):
+        # Get images for this sample
+        sample_images = [img[i] for img in images_to_concat]
+        
+        # Resize all images to same height (use control image height as reference)
+        _, h, w = sample_images[0].shape
+        resized_images = []
+        
+        for img in sample_images:
+            _, img_h, img_w = img.shape
+            if img_h != h or img_w != w:
+                # Resize to match control image dimensions
+                img_resized = torch.nn.functional.interpolate(
+                    img.unsqueeze(0), 
+                    size=(h, w), 
+                    mode='bilinear', 
+                    align_corners=False
+                ).squeeze(0)
+                resized_images.append(img_resized)
+            else:
+                resized_images.append(img)
+        
+        # Add padding between images
+        padded_images = []
+        for j, img in enumerate(resized_images):
+            if j > 0:  # Add white padding before image (except first)
+                pad_strip = torch.ones(img.shape[0], img.shape[1], padding)
+                padded_images.append(pad_strip)
+            padded_images.append(img)
+        
+        # Concatenate horizontally (along width dimension)
+        concatenated = torch.cat(padded_images, dim=2)  # [C, H, W_total]
+        concatenated_rows.append(concatenated)
+    
+    # Stack all samples vertically if batch > 1
+    if len(concatenated_rows) > 1:
+        # Add horizontal separator between rows
+        final_rows = []
+        for i, row in enumerate(concatenated_rows):
+            if i > 0:
+                separator = torch.ones(row.shape[0], padding, row.shape[2])
+                final_rows.append(separator)
+            final_rows.append(row)
+        final_image = torch.cat(final_rows, dim=1)  # [C, H_total, W]
+    else:
+        final_image = concatenated_rows[0]
+    
+    logged = False
+    
+    # Log to W&B
+    try:
+        run = accelerator.get_tracker("wandb", unwrap=True)
+        if run is not None:
+            import wandb
+            npimg = final_image.permute(1, 2, 0).numpy()  # CHW -> HWC
+            run.log({tag: wandb.Image(npimg, caption=caption)}, step=step)
+            logged = True
+            logging.info(f"Logged comparison image '{tag}' to wandb at step {step}")
+    except Exception as e:
+        logging.warning(f"Failed to log comparison image to wandb: {e}")
+    
+    # Log to TensorBoard
+    try:
+        tb = accelerator.get_tracker("tensorboard")
+        if hasattr(tb, "writer"):
+            tb.writer.add_image(tag, final_image, step, dataformats="CHW")
+            logged = True
+    except Exception:
+        pass
+    
+    if not logged:
+        accelerator.log({f"{tag}/num_images": int(batch_size)}, step=step)
+
+
 def log_text_auto(accelerator, tag, rows, step, max_rows=64):
     """
     rows: list[dict] 或 list[str]

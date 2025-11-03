@@ -33,3 +33,15 @@ blake3
 pillow
 rich
 imagehash
+gradio
+openai
+trl>=0.22.0
+qwen-vl-utils>=0.0.11
+evaluate  # Optional: for computing BLEU/ROUGE/BERTScore metrics
+
+# Optional: Semantic evaluation metrics for validation
+bert-score>=0.3.13         # BERT-based semantic similarity
+rouge-score>=0.1.2         # ROUGE metrics for text overlap
+sentence-transformers>=2.2.0  # Semantic similarity via embeddings
+scikit-learn>=1.0.0        # For cosine similarity computation
+lpips>=0.1.4               # Learned Perceptual Image Patch Similarity for image quality

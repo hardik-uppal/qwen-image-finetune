@@ -42,34 +42,45 @@ class MaskEditLoss(nn.Module):
         super().__init__()
         self.forground_weight = forground_weight
         self.background_weight = background_weight
+        self.last_mask_norm_factor = None  # Track normalization factor for logging
 
     def forward(self, mask, model_pred, target, weighting=None):
         """
-        计算mask加权的loss
+        Compute mask-weighted loss with proper ordering:
+        1. Compute per-pixel MSE
+        2. Apply min-SNR temporal weighting (if provided)
+        3. Apply spatial mask weighting (normalized to mean ≈ 1)
+        
         Args:
-            mask: [B, seq_len] - 二进制掩码，1表示修改区域，0表示背景区域
-            model_pred: [B, seq_len, channels] - 模型预测结果
-            target: [B, seq_len, channels] - 目标值
-            weighting: [B, seq_len, 1] - 可选的时间步权重
+            mask: [B, seq_len] - Binary mask, 1=edit region, 0=background
+            model_pred: [B, seq_len, channels] - Model predictions
+            target: [B, seq_len, channels] - Target values
+            weighting: [B, seq_len, 1] - Optional temporal weights (e.g., min-SNR)
         Returns:
-            torch.Tensor - 加权后的loss值
+            torch.Tensor - Weighted loss scalar
         """
-        # 计算基础element-wise loss
+        # Step 1: Compute element-wise MSE
         element_loss = (model_pred.float() - target.float()) ** 2
 
-        # 如果有weighting，应用到element_loss
+        # Step 2: Apply temporal weighting (min-SNR) if provided
         if weighting is not None:
             element_loss = weighting.float() * element_loss
 
-        # 创建权重掩码：文本区域权重更高
+        # Step 3: Create spatial mask weights (foreground vs background)
         # mask: [B, seq_len] -> weight_mask: [B, seq_len, 1]
         weight_mask = (mask * self.forground_weight + (1 - mask) * self.background_weight)
-        weight_mask = weight_mask.unsqueeze(-1)  # [B, seq_len, 1]
+        
+        # Normalize mask weights to mean ≈ 1 (prevents loss scaling issues)
+        # This ensures mask weighting doesn't artificially inflate or deflate the loss magnitude
+        mask_mean = weight_mask.mean(dim=1, keepdim=True).detach()  # [B, 1]
+        self.last_mask_norm_factor = mask_mean.mean().item()  # Store for logging
+        weight_mask_normalized = weight_mask / (mask_mean + 1e-8)
+        weight_mask_normalized = weight_mask_normalized.unsqueeze(-1)  # [B, seq_len, 1]
 
-        # 应用mask权重
-        weighted_loss = element_loss * weight_mask
+        # Apply normalized mask weights
+        weighted_loss = element_loss * weight_mask_normalized
 
-        # 聚合loss：先按序列维度求均值，再按batch维度求均值
+        # Aggregate: mean over sequence, then mean over batch
         loss = torch.mean(weighted_loss.reshape(target.shape[0], -1), 1).mean()
         return loss
 

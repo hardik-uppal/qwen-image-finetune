@@ -135,6 +135,31 @@ class QwenImageEditTrainer(BaseTrainer):
         torch.cuda.empty_cache()
 
         logging.info(f"Components loaded successfully. VAE scale factor: {self.vae_scale_factor}")
+        
+        # Log loss configuration
+        logging.info("=" * 60)
+        logging.info("LOSS CONFIGURATION")
+        logging.info("=" * 60)
+        prediction_type = self.config.loss.prediction_type
+        if prediction_type is None:
+            prediction_type = getattr(self.scheduler.config, 'prediction_type', 'v_prediction')
+            logging.info(f"Prediction type: {prediction_type} (auto-detected from scheduler)")
+        else:
+            logging.info(f"Prediction type: {prediction_type} (from config)")
+        
+        if self.config.loss.use_min_snr:
+            logging.info(f"✓ Min-SNR weighting: ENABLED (γ={self.config.loss.min_snr_gamma})")
+            logging.info(f"  This will improve convergence by preventing overfitting at extreme noise levels")
+        else:
+            logging.info(f"  Min-SNR weighting: DISABLED (standard uniform loss)")
+        
+        logging.info(f"Timestep sampling: UNIFORM (weighting only affects loss, not sampling)")
+        
+        if self.config.loss.mask_loss:
+            logging.info(f"✓ Mask loss: ENABLED (fg={self.config.loss.forground_weight}, bg={self.config.loss.background_weight})")
+        else:
+            logging.info(f"  Mask loss: DISABLED")
+        logging.info("=" * 60)
 
     def preprocess_image_for_vae_encoder(self, image):
         """
@@ -633,18 +658,111 @@ class QwenImageEditTrainer(BaseTrainer):
             return_dict=False,
         )[0]
         model_pred = model_pred[:, : image_latents.size(1)]
-        weighting = compute_loss_weighting_for_sd3(weighting_scheme="none", sigmas=sigmas)
-        target = noise - image_latents
+        
+        # Determine prediction type
+        prediction_type = self.config.loss.prediction_type
+        if prediction_type is None:
+            # Auto-detect from scheduler
+            prediction_type = getattr(self.scheduler.config, 'prediction_type', 'v_prediction')
+        
+        # Compute target based on prediction type
+        if prediction_type == "epsilon":
+            target = noise
+        elif prediction_type == "v_prediction":
+            target = noise - image_latents
+        elif prediction_type == "sample":
+            target = image_latents
+        else:
+            # Default to v_prediction (flow matching)
+            target = noise - image_latents
+            prediction_type = "v_prediction"
+        
+        # Compute per-sample MSE for unweighted loss tracking
+        # Shape: [B, seq_len, channels] -> [B]
+        mse_per_sample = torch.nn.functional.mse_loss(
+            model_pred.float(), 
+            target.float(), 
+            reduction="none"
+        ).mean(dim=[1, 2])  # [B]
+        
+        # Compute unweighted loss (for monitoring real progress)
+        loss_unweighted = mse_per_sample.mean()
+        
+        # Compute loss weighting
+        if self.config.loss.use_min_snr:
+            # Use min-SNR weighting for better convergence
+            from src.utils.min_snr_loss import compute_min_snr_weights_from_sigmas
+            
+            # Flatten sigmas to [batch_size]
+            sigmas_flat = sigmas.reshape(batch_size, -1)[:, 0]
+            
+            # Compute min-SNR weights with optional normalization
+            min_snr_weights = compute_min_snr_weights_from_sigmas(
+                sigmas_flat.unsqueeze(-1),
+                gamma=self.config.loss.min_snr_gamma,
+                prediction_type=prediction_type,
+                normalize_weights=self.config.loss.min_snr_normalize_weights,
+            )
+            
+            # Reshape weights to match model_pred dimensions
+            weighting = min_snr_weights.reshape(batch_size, 1, 1)
+            while weighting.ndim < model_pred.ndim:
+                weighting = weighting.unsqueeze(-1)
+            
+            # Log min-SNR info (every 10 steps for better tracking)
+            if self.accelerator.is_main_process and self.global_step % 10 == 0:
+                min_snr_metrics = {
+                    'training/min_snr_weight_mean': min_snr_weights.mean().item(),
+                    'training/min_snr_weight_std': min_snr_weights.std().item(),
+                    'training/min_snr_weight_min': min_snr_weights.min().item(),
+                    'training/min_snr_weight_max': min_snr_weights.max().item(),
+                }
+                self.accelerator.log(min_snr_metrics, step=self.global_step)
+        else:
+            # No weighting (standard loss)
+            weighting = compute_loss_weighting_for_sd3(weighting_scheme="none", sigmas=sigmas)
+        
         # pred shape [2, 4104, 64], target shape [2, 4104, 64]
         loss_result = self.forward_loss(model_pred, target, weighting, edit_mask)
+        
+        # Log both weighted and unweighted losses for comparison
+        if self.accelerator.is_main_process and self.global_step % 10 == 0:
+            loss_comparison_metrics = {
+                'loss/unweighted': loss_unweighted.item(),
+            }
+            # Add weighted loss if available
+            if isinstance(loss_result, dict):
+                loss_comparison_metrics['loss/weighted'] = loss_result['total_loss'].item()
+            else:
+                loss_comparison_metrics['loss/weighted'] = loss_result.item()
+            
+            # Add batch data statistics for anomaly detection
+            batch_stats = {
+                'data/target_magnitude': target.abs().mean().item(),
+                'data/target_std': target.std().item(),
+                'data/pred_magnitude': model_pred.abs().mean().item(),
+                'data/latent_magnitude': image_latents.abs().mean().item(),
+            }
+            if edit_mask is not None:
+                batch_stats['data/mask_mean'] = edit_mask.float().mean().item()
+            
+            loss_comparison_metrics.update(batch_stats)
+            self.accelerator.log(loss_comparison_metrics, step=self.global_step)
         
         # Log timestep statistics
         if self.accelerator.is_main_process and self.global_step % 10 == 0:
             timestep_metrics = {
                 'training/timestep_mean': timesteps.float().mean().item(),
                 'training/timestep_std': timesteps.float().std().item(),
+                'training/timestep_min': timesteps.float().min().item(),
+                'training/timestep_max': timesteps.float().max().item(),
             }
             self.accelerator.log(timestep_metrics, step=self.global_step)
+            
+            # Log to console for debugging
+            if self.global_step % 100 == 0:
+                logging.info(f"Timestep range: min={timesteps.min().item():.1f}, max={timesteps.max().item():.1f}, mean={timesteps.mean().item():.1f}")
+                logging.info(f"Scheduler timesteps available: {len(self.scheduler.timesteps)} timesteps from {self.scheduler.timesteps[0]:.1f} to {self.scheduler.timesteps[-1]:.1f}")
         
         # Log mask loss breakdown if available
         if isinstance(loss_result, dict):
@@ -656,6 +774,10 @@ class QwenImageEditTrainer(BaseTrainer):
                     mask_metrics['loss/background'] = loss_result['bg_loss'].item()
                 if 'mask_coverage' in loss_result:
                     mask_metrics['loss/mask_coverage'] = loss_result['mask_coverage'].item()
+                
+                # Log mask normalization factor if available
+                if hasattr(self.criterion, 'last_mask_norm_factor') and self.criterion.last_mask_norm_factor is not None:
+                    mask_metrics['loss/mask_norm_factor'] = self.criterion.last_mask_norm_factor
                 
                 if mask_metrics:
                     self.accelerator.log(mask_metrics, step=self.global_step)
@@ -723,6 +845,13 @@ class QwenImageEditTrainer(BaseTrainer):
             .to(image_latents.device, image_latents.dtype)
         )
         image_latents = (image_latents - latents_mean) / latents_std
+
+        # Validate latents for NaN or Inf
+        if torch.isnan(image_latents).any() or torch.isinf(image_latents).any():
+            logging.error(f"NaN or Inf detected in VAE latents!")
+            logging.error(f"Input image stats - min: {image.min().item():.4f}, max: {image.max().item():.4f}, mean: {image.mean().item():.4f}")
+            logging.error(f"Latent stats before norm - has NaN: {torch.isnan(image_latents).any()}, has Inf: {torch.isinf(image_latents).any()}")
+            raise ValueError("VAE produced NaN or Inf latents - check input image quality")
 
         return image_latents
 
@@ -1007,7 +1136,12 @@ class QwenImageEditTrainer(BaseTrainer):
     def sampling_from_embeddings(self, embeddings: dict) -> torch.Tensor:
         """Sampling from embeddings. Only handle the latent diffusion steps. Output the final latents. Need
         to decode the latents to images.
+        
+        Uses the separate inference scheduler to avoid affecting training timesteps.
         """
+        # Use inference scheduler (not training scheduler)
+        scheduler = self.inference_scheduler if self.inference_scheduler is not None else self.scheduler
+        
         num_inference_steps = embeddings["num_inference_steps"]
         true_cfg_scale = embeddings["true_cfg_scale"]
         control_latents = embeddings["control_latents"]
@@ -1026,11 +1160,11 @@ class QwenImageEditTrainer(BaseTrainer):
         device = self.dit.device
 
         if do_true_cfg:
-            # 清理显存以确保有足够空间进行 CFG
+            # Clear VRAM to ensure enough space for CFG
             torch.cuda.empty_cache()
             logging.info(f"negative_prompt: {negative_prompt}")
 
-            # 临时将 positive prompt embeddings 移到 CPU 以节省显存
+            # Temporarily move positive prompt embeddings to CPU to save VRAM
             negative_prompt_embeds = embeddings["negative_prompt_embeds"]
             negative_prompt_embeds_mask = embeddings["negative_prompt_embeds_mask"]
             negative_prompt_embeds_mask = negative_prompt_embeds_mask.to(device, dtype=torch.int64)
@@ -1085,8 +1219,8 @@ class QwenImageEditTrainer(BaseTrainer):
             else None
         )
 
-        # 7. 降噪循环 (遵循原始pipeline逻辑)
-        self.scheduler.set_begin_index(0)
+        # 7. Denoising loop (following original pipeline logic)
+        scheduler.set_begin_index(0)
         self.attention_kwargs = {}
 
         # set to proper device
@@ -1164,7 +1298,7 @@ class QwenImageEditTrainer(BaseTrainer):
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents_dtype = latents.dtype
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
                 if latents.dtype != latents_dtype:
                     if torch.backends.mps.is_available():

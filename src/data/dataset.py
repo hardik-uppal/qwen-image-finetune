@@ -273,7 +273,7 @@ class ImageDataset(Dataset):
         return samples
 
     def _load_csv_dataset(self, dataset_path: str) -> List[dict]:
-        """Load dataset from CSV file.
+        """Load dataset from CSV file with validation.
         samples.append(
                 {
                     "image": image_path,
@@ -289,14 +289,40 @@ class ImageDataset(Dataset):
 
         df = pd.read_csv(dataset_path)
         start_idx = len(self.all_samples)
-        # calculate contrl numbers
+        
+        # Validate required columns
+        if 'path_target' not in df.columns or 'prompt' not in df.columns:
+            raise ValueError(f"CSV must contain 'path_target' and 'prompt' columns. Found: {df.columns.tolist()}")
+        
+        # Check for NaN in required columns
+        nan_targets = df['path_target'].isna().sum()
+        nan_prompts = df['prompt'].isna().sum()
+        if nan_targets > 0 or nan_prompts > 0:
+            logging.warning(f"Found {nan_targets} NaN targets and {nan_prompts} NaN prompts in CSV {dataset_path}")
+            logging.warning(f"These rows will be skipped during training")
+        
+        # calculate control numbers
         columns = df.columns
         columns = [x for x in columns if 'path_control' in x]
         control_keys = sorted(columns)
+        
         samples = []
+        skipped_count = 0
         for idx, row in df.iterrows():
+            # Skip rows with NaN in required fields
+            if pd.isna(row["path_target"]) or pd.isna(row["prompt"]):
+                skipped_count += 1
+                continue
+                
             # Filter out NaN values from controls (empty CSV cells become NaN)
             controls = [row[x] for x in control_keys if pd.notna(row[x])]
+            
+            # Validate at least one control image exists
+            if len(controls) == 0:
+                logging.warning(f"Row {idx} has no control images, skipping")
+                skipped_count += 1
+                continue
+                
             prompt = row["prompt"]
             data = {
                 "image": row["path_target"],
@@ -307,10 +333,15 @@ class ImageDataset(Dataset):
                 "global_index": start_idx + idx,
 
             }
-            if 'path_mask' in row:
+            if 'path_mask' in row and pd.notna(row['path_mask']):
                 mask_file = row["path_mask"]
                 data['mask_file'] = mask_file
             samples.append(data)
+        
+        if skipped_count > 0:
+            logging.warning(f"Skipped {skipped_count} invalid rows out of {len(df)} total rows in {dataset_path}")
+        logging.info(f"Loaded {len(samples)} valid samples from {dataset_path}")
+        
         return samples
 
     def _find_directories(self, dataset_path: str) -> List[str]:

@@ -1,0 +1,103 @@
+# Production Pipeline Configuration
+# Distributed image editing pipeline with external vLLM + Ray Serve
+
+# GPU allocation for this server (8 GPUs: indices 0-7)
+# Note: vLLM is hosted externally, so we only allocate GPUs for image editing
+gpu_allocation:
+  image_edit_service: [0, 1, 2, 3, 4, 5, 6, 7]  # All 8 GPUs for Qwen-Image-Edit-2509
+
+# Service endpoints
+services:
+  # External vLLM server
+  vl_endpoint: "http://192.168.20:8000/v1"
+  # Local Ray Serve endpoint
+  image_edit_endpoint: "http://localhost:8001"
+
+# Model configurations
+models:
+  qwen_vl:
+    model_name: "Qwen/Qwen2.5-VL-72B-Instruct"
+    tensor_parallel_size: 4
+    max_model_len: 8192
+    gpu_memory_utilization: 0.85
+    api_key: "EMPTY"
+    lora_path: null  # Optional: Path to VL LoRA, e.g., "/path/to/vl_lora" or "username/repo-name"
+    lora_name: "vl_lora"  # Name for the LoRA adapter (used with --enable-lora)
+    system_prompt: "You are a senior photo editor. Given a control image and the user's intent, produce precise, actionable editing instructions that a diffusion model can follow. Mention lighting, colors, composition, geometry corrections, and stylistic cues."
+  
+  qwen_image_edit:
+    model_name: "Qwen/Qwen-Image-Edit-2509"
+    lora_path: null  # Set to path for custom LoRA, e.g., "/path/to/lora.safetensors"
+    dtype: "bfloat16"  # More stable than float16, faster than float32
+    num_replicas: 2  # 2 replicas, each using 4 GPUs
+    gpus_per_replica: 4  # Shard model across 4 GPUs per replica
+    max_concurrent_queries_per_replica: 2
+    gradient_checkpointing: false
+
+# Pipeline settings
+pipeline:
+  vision_generator: "vllm_client"
+  image_editor: "ray_serve_client"
+  upscaler: "tiled"  # Uses image_editor with tiling
+  
+  # Vision generation defaults
+  vision_defaults:
+    temperature: 0.2
+    max_tokens: 512
+    max_edge: 1024
+    jpeg_quality: 90
+  
+  # Image editing defaults
+  edit_defaults:
+    num_inference_steps: 20
+    guidance_scale: 4.0
+    max_size: 1328  # Max size on longer side (aspect ratio preserved)
+    negative_prompt: "blurry, low quality, distorted, artifacts"
+    timeout_seconds: 900
+  
+  # Tiled upscaling config
+  tiling:
+    tile_width: 512
+    tile_height: 512
+    overlap: 64
+    mask_blur: 8
+    upscale_factor: 2.0
+    num_inference_steps: 15  # Fewer steps for upscaling
+    guidance_scale: 3.5
+    prompt_template: "enhance quality, add detail, sharpen, ultra high resolution, professional photography"
+    use_control_image: true
+    control_max_size: 1328  # Max size on longer side for full image control (replaces control_crop_factor)
+    timeout_seconds: 1800  # 30 minutes for upscaling (multiple tiles processed sequentially)
+
+# Frontend settings
+frontend:
+  host: "0.0.0.0"
+  port: 7860
+  enable_metrics: true
+  enable_queue: true
+  max_concurrent_requests: 8  # 2 replicas × 2 concurrent × 2 safety factor
+  share: true
+  auth: null  # Set to {"username": "password"} for authentication
+
+# Monitoring and logging
+monitoring:
+  log_level: "INFO"
+  enable_gpu_monitoring: true
+  metrics_port: 9090
+  health_check_interval: 30  # seconds
+  
+# Ray Serve configuration
+ray_serve:
+  http_options:
+    host: "0.0.0.0"
+    port: 8001
+  grpc_options:
+    enable: false
+  # Autoscaling: Comment this out to use fixed num_replicas instead
+  # autoscaling_config:
+  #   target_ongoing_requests: 1
+  #   min_replicas: 2
+  #   max_replicas: 4
+  #   downscale_delay_s: 600
+  #   upscale_delay_s: 30
+

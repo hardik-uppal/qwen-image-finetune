@@ -3,7 +3,7 @@ ValidationSampler for monitoring training progress through image sampling.
 Supports both FluxKontext and QwenImageEdit trainers.
 """
 import logging
-from typing import Dict, List, Union
+from typing import Dict, List, Union, Optional
 import torch
 from torch.utils.data import ConcatDataset
 from torch.utils.data import Dataset
@@ -13,9 +13,10 @@ from src.data.config import DataConfig
 import math
 import cv2
 
-from src.utils.logger import log_images_auto
+from src.utils.logger import log_images_auto, log_comparison_images
 from src.utils.tools import sample_indices_per_rank
 from src.data.dataset import ImageDataset
+from src.utils.metrics import ImageMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,8 @@ class ValidationSampler:
         accelerator: Accelerator,
         weight_dtype: torch.dtype = torch.bfloat16,
         data_config: DataConfig | None = None,
+        compute_metrics: bool = True,
+        lpips_net: str = 'alex',
     ):
         self.config = config
         self.data_config = data_config
@@ -48,6 +51,23 @@ class ValidationSampler:
             "skip_on_error": True,
             "samples_per_process": 1,
         }
+        
+        # Initialize metrics
+        self.compute_metrics = compute_metrics
+        self.metrics_calculator: Optional[ImageMetrics] = None
+        if compute_metrics and accelerator.is_main_process:
+            try:
+                self.metrics_calculator = ImageMetrics(
+                    compute_lpips=True,
+                    lpips_net=lpips_net,
+                    device=accelerator.device,
+                )
+                logger.info("Initialized image quality metrics (LPIPS, MSE, PSNR)")
+            except Exception as e:
+                logger.warning(f"Failed to initialize metrics: {e}")
+                logger.warning("Validation will run without quality metrics")
+                self.compute_metrics = False
+        
         self.get_accelerator_attribute()
         self.setup_validation_dataset()
 
@@ -207,6 +227,11 @@ class ValidationSampler:
 
         logger.info(f"Starting validation at step {global_step} with {len(self.cached_embeddings)} samples")
         
+        # Accumulated metrics across all samples
+        all_metrics = {}
+        all_losses = []  # Track validation loss for each sample
+        samples_with_targets = 0
+        
         try:
             # Sample from cached embeddings
             for idx, (data, cache_embedding) in enumerate(zip(
@@ -222,7 +247,7 @@ class ValidationSampler:
                 else:
                     control = torch.from_numpy(control).unsqueeze(0)
                 
-                # Normalize to [-1, 1] range for log_images_auto
+                # Normalize to [-1, 1] range
                 control = control.float()
                 
                 # Detect range and normalize appropriately
@@ -238,16 +263,8 @@ class ValidationSampler:
                 else:
                     logger.info(f"Keeping as-is (assumed [-1, 1] range)")
                 
-                logger.info(f"Logging control image {idx+1}/{len(self.cached_embeddings)}")
-                log_images_auto(
-                    self.accelerator,
-                    f"validation/control_{self.local_rank}_sample{idx}",
-                    control,
-                    global_step,
-                    caption=prompt,
-                )
-                
-                # Log target/ground truth image if available
+                # Prepare target image if available
+                target = None
                 if "image" in data:
                     target = data["image"]
                     # Handle tensor/numpy conversion
@@ -266,15 +283,6 @@ class ValidationSampler:
                         target = (target / 255.0) * 2 - 1
                     elif target_min >= 0 and target_max <= 1.0:
                         target = target * 2 - 1
-                    
-                    logger.info(f"Logging target/ground truth image {idx+1}/{len(self.cached_embeddings)}")
-                    log_images_auto(
-                        self.accelerator,
-                        f"validation/target_{self.local_rank}_sample{idx}",
-                        target,
-                        global_step,
-                        caption=f"GT: {prompt}",
-                    )
                 
                 # Generate sample using cached embeddings and trainer's model
                 logger.info(f"Generating image {idx+1}/{len(self.cached_embeddings)}")
@@ -287,13 +295,85 @@ class ValidationSampler:
                 generated_image = trainer.decode_vae_latent(generated_latents, height, width)
                 
                 logger.info(f"Generated image shape: {generated_image.shape}, range: [{generated_image.min():.3f}, {generated_image.max():.3f}]")
-                logger.info(f"Logging generated image {idx+1}/{len(self.cached_embeddings)}")
-                log_images_auto(
+                
+                # Convert from [0, 1] to [-1, 1]
+                generated_image = generated_image * 2 - 1
+                
+                # Compute validation loss and metrics if target is available
+                if target is not None:
+                    # Compute validation loss (MSE between generated and target)
+                    val_loss = torch.nn.functional.mse_loss(
+                        generated_image.float(), 
+                        target.float(), 
+                        reduction='mean'
+                    ).item()
+                    all_losses.append(val_loss)
+                    
+                    # Compute image quality metrics if enabled
+                    if self.compute_metrics and self.metrics_calculator is not None:
+                        try:
+                            # Compute all metrics (LPIPS, MSE, PSNR)
+                            # Images are in [-1, 1] range
+                            sample_metrics = self.metrics_calculator.compute_all(
+                                generated=generated_image,
+                                target=target,
+                                normalize_lpips=True,  # Images are in [-1, 1]
+                                max_value=2.0,  # Range is [-1, 1], so max_value = 2
+                            )
+                            
+                            # Add validation loss to metrics
+                            sample_metrics['val_loss'] = val_loss
+                            
+                            # Accumulate metrics for averaging
+                            for metric_name, value in sample_metrics.items():
+                                if metric_name not in all_metrics:
+                                    all_metrics[metric_name] = 0.0
+                                all_metrics[metric_name] += value
+                            
+                            samples_with_targets += 1
+                            
+                            logger.info(
+                                f"Sample {idx+1} metrics: " + 
+                                ", ".join([f"{k}={v:.4f}" for k, v in sample_metrics.items()])
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to compute metrics for sample {idx}: {e}")
+                    else:
+                        # Even without metrics calculator, track loss
+                        if 'val_loss' not in all_metrics:
+                            all_metrics['val_loss'] = 0.0
+                        all_metrics['val_loss'] += val_loss
+                        samples_with_targets += 1
+                
+                # Log comparison images (control | target | generated)
+                logger.info(f"Logging comparison images {idx+1}/{len(self.cached_embeddings)}")
+                log_comparison_images(
                     self.accelerator,
-                    f"validation/generated_{self.local_rank}_sample{idx}",
-                    generated_image,
-                    global_step,
-                    caption=f"Pred: {prompt}",
+                    f"validation_images/comparison_{self.local_rank}_sample{idx}",
+                    control_images=control,
+                    generated_images=generated_image,
+                    target_images=target,
+                    step=global_step,
+                    caption=prompt,
+                )
+            
+            # Log averaged metrics across all samples with separate tag for metrics
+            if samples_with_targets > 0 and all_metrics and self.accelerator.is_main_process:
+                avg_metrics = {
+                    f"validation_metrics/{key}": value / samples_with_targets 
+                    for key, value in all_metrics.items()
+                }
+                
+                # Also add a summary metric with the main validation loss
+                if all_losses:
+                    avg_metrics['validation/loss'] = sum(all_losses) / len(all_losses)
+                
+                # Log to tracker (wandb/tensorboard)
+                self.accelerator.log(avg_metrics, step=global_step)
+                
+                logger.info(
+                    f"Validation metrics (averaged over {samples_with_targets} samples): " +
+                    ", ".join([f"{k.split('/')[-1]}={v:.4f}" for k, v in avg_metrics.items()])
                 )
             
             logger.info(f"Validation complete at step {global_step}")

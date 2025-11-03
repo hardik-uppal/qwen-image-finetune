@@ -50,17 +50,17 @@ def collect_lora_linears(root: nn.Module):
     loras = []
     for m in root.modules():
         if isinstance(m, nn.Linear):
-            # 常见 PEFT LoRA 标记
+            # Common PEFT LoRA markers
             if (
                 hasattr(m, "lora_A")
                 or hasattr(m, "lora_B")
                 or hasattr(m, "lora_embedding_A")
                 or hasattr(m, "lora_embedding_B")
                 or hasattr(m, "lora_edit")
-            ):  # 你自定义的标记
+            ):  # Custom LoRA marker
                 loras.append(m)
                 continue
-            # 兜底：该 Linear 下有名字包含 "lora" 的子参数，或除了 weight/bias 外仍有可训练参数
+            # Fallback: Linear layer has parameters with "lora" in name, or trainable params besides weight/bias
             names_params = dict(m.named_parameters(recurse=False))
             if any(("lora" in n) for n in names_params.keys()):
                 loras.append(m)
@@ -85,6 +85,7 @@ class BaseTrainer(ABC):
         self.lr_scheduler = None
         self.global_step = 0
         self.scheduler: FlowMatchEulerDiscreteScheduler = None
+        self.inference_scheduler: Optional[FlowMatchEulerDiscreteScheduler] = None  # Separate scheduler for validation
 
         # Common attributes that all trainers should have
         self.weight_dtype = torch.bfloat16
@@ -98,7 +99,7 @@ class BaseTrainer(ABC):
         self.adapter_name = self.config.model.lora.adapter_name
         self.predict_setted = False
 
-        # 为save_last_checkpoint功能添加属性
+        # Attribute for save_last_checkpoint functionality
         self.training_interrupted = False
         self.log_model_info()
         self.load_preprocessor()
@@ -119,10 +120,10 @@ class BaseTrainer(ABC):
         return msg
 
     def setup_signal_handlers(self):
-        """设置信号处理器来捕获Ctrl+C中断"""
+        """Set up signal handlers to capture Ctrl+C interrupts"""
 
         def signal_handler(signum, frame):
-            logging.info("收到中断信号，准备保存最后一个检查点...")
+            logging.info("Received interrupt signal, preparing to save final checkpoint...")
             self.training_interrupted = True
 
         signal.signal(signal.SIGINT, signal_handler)
@@ -134,21 +135,21 @@ class BaseTrainer(ABC):
         logger.info(f"Use Cache: {self.use_cache}")
 
     def setup_versioned_logging_dir(self):
-        """设置版本化的日志目录"""
+        """Set up versioned logging directory"""
         base_output_dir = self.config.logging.output_dir
         project_name = self.config.logging.tracker_project_name
 
-        # 创建项目目录结构: output_dir/project_name/v0
+        # Create project directory structure: output_dir/project_name/v0
         project_dir = os.path.join(base_output_dir, project_name)
 
-        # 如果项目目录不存在，直接使用 v0
+        # If project directory doesn't exist, use v0 directly
         if not os.path.exists(project_dir):
             versioned_dir = os.path.join(project_dir, "v0")
             self.config.logging.output_dir = versioned_dir
-            logging.info(f"创建新的训练版本目录: {versioned_dir}")
+            logging.info(f"Creating new training version directory: {versioned_dir}")
             return
 
-        # 查找现有版本
+        # Find existing versions
         existing_versions = []
         for item in os.listdir(project_dir):
             item_path = os.path.join(project_dir, item)
@@ -156,32 +157,32 @@ class BaseTrainer(ABC):
                 version_num = int(item[1:])
                 existing_versions.append((version_num, item_path))
 
-        # 清理无效版本（训练步数 < 5）
+        # Clean up invalid versions (training steps < 5)
         valid_versions = []
         for version_num, version_path in existing_versions:
             if self._is_valid_training_version(version_path):
                 valid_versions.append(version_num)
             else:
-                logging.info(f"移除无效训练版本: {version_path}")
+                logging.info(f"Removing invalid training version: {version_path}")
                 try:
                     shutil.rmtree(version_path)
                 except Exception as e:
-                    logging.info(f"移除无效训练版本失败: {version_path}, {e}")
+                    logging.info(f"Failed to remove invalid training version: {version_path}, {e}")
 
-        # 确定新版本号
+        # Determine new version number
         if valid_versions:
             next_version = max(valid_versions) + 1
         else:
             next_version = 0
 
-        # 创建新版本目录
+        # Create new version directory
         versioned_dir = os.path.join(project_dir, f"v{next_version}")
         self.config.logging.output_dir = versioned_dir
-        logging.info(f"使用训练版本目录: {versioned_dir}")
+        logging.info(f"Using training version directory: {versioned_dir}")
 
     def _is_valid_training_version(self, version_path):
-        """if the folder consist checkpoint, return True"""
-        # 检查 checkpoint 目录
+        """Returns True if the folder contains a checkpoint"""
+        # Check checkpoint directory
 
         checkpoints = glob.glob(f"{version_path}/*/*.safetensors")
         return len(checkpoints) > 0
@@ -191,14 +192,20 @@ class BaseTrainer(ABC):
         # from diffusers.loaders import AttnProcsLayers
         # from src.utils.lora_utils import get_lora_layers
         # lora_layers_model = AttnProcsLayers(get_lora_layers(self.dit))
-        # 根据配置决定是否启用梯度检查点
+        # Enable gradient checkpointing based on configuration
         if self.config.train.gradient_checkpointing:
             self.dit.enable_gradient_checkpointing()
         if self.config.resume is not None:
-            # self.accelerator.load_state(self.config.train.resume_from_checkpoint)
-            self.optimizer.load_state_dict(torch.load(os.path.join(self.config.resume, "optimizer.bin")))
-            self.lr_scheduler.load_state_dict(torch.load(os.path.join(self.config.resume, "scheduler.bin")))
-            logging.info(f"Loaded optimizer and scheduler from {self.config.resume}")
+            # Try to load optimizer and scheduler state if they exist (only in "last" checkpoints)
+            optimizer_path = os.path.join(self.config.resume, "optimizer.bin")
+            scheduler_path = os.path.join(self.config.resume, "scheduler.bin")
+            
+            if os.path.exists(optimizer_path) and os.path.exists(scheduler_path):
+                self.optimizer.load_state_dict(torch.load(optimizer_path))
+                self.lr_scheduler.load_state_dict(torch.load(scheduler_path))
+                logging.info(f"Loaded optimizer and scheduler from {self.config.resume}")
+            else:
+                logging.info(f"Optimizer/scheduler state not found in {self.config.resume}, will reinitialize (expected for regular checkpoints)")
 
         # sdp_kernel(enable_flash=False, enable_math=False, enable_mem_efficient=True)
 
@@ -218,8 +225,8 @@ class BaseTrainer(ABC):
             # plug.forward_prefetch = False
             # plug.backward_prefetch = BackwardPrefetch.BACKWARD_POST
             plug.forward_prefetch = True
-            plug.backward_prefetch = BackwardPrefetch.BACKWARD_PRE  # 边回传边预取
-            plug.sync_module_states = True  # 主卡广播初始化，避免不一致
+            plug.backward_prefetch = BackwardPrefetch.BACKWARD_PRE  # Prefetch during backward pass
+            plug.sync_module_states = True  # Broadcast initialization from main GPU to avoid inconsistencies
             plug.min_num_params = 20_000_000  # 5_000_000
             plug.mixed_precision = MixedPrecision(
                 param_dtype=torch.bfloat16,
@@ -227,10 +234,10 @@ class BaseTrainer(ABC):
                 buffer_dtype=torch.bfloat16,
                 cast_forward_inputs=False,
             )
-            # from src.models.transformer_qwenimage import QwenImageTransformerBlock  # 你的类路径
+            # from src.models.transformer_qwenimage import QwenImageTransformerBlock  # Your class path
             # plug.auto_wrap_policy = partial(
             #     transformer_auto_wrap_policy,
-            #     transformer_layer_cls={QwenImageTransformerBlock},  # 注意：是关键字参数
+            #     transformer_layer_cls={QwenImageTransformerBlock},  # Note: keyword argument
             # )
             plug.auto_wrap_policy = partial(size_based_auto_wrap_policy, min_num_params=plug.min_num_params)
             # from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
@@ -313,6 +320,8 @@ class BaseTrainer(ABC):
             accelerator=self.accelerator,
             weight_dtype=self.weight_dtype,
             data_config=self.config.data,
+            compute_metrics=self.config.logging.sampling.compute_metrics,
+            lpips_net=self.config.logging.sampling.lpips_net,
         )
         
         # Setup validation dataset
@@ -474,11 +483,19 @@ class BaseTrainer(ABC):
         return metrics
 
     def train_epoch(self, epoch, train_dataloader):
+        # Log epoch start
+        if self.accelerator.is_main_process:
+            logging.info(f"=" * 60)
+            logging.info(f"Starting Epoch {epoch} | Global Step: {self.global_step}")
+            logging.info(f"Dataloader shuffle: {train_dataloader.dataset.generator is not None if hasattr(train_dataloader.dataset, 'generator') else 'N/A'}")
+            logging.info(f"Dataset size: {len(train_dataloader.dataset)}")
+            logging.info(f"=" * 60)
+        
         for _, batch in enumerate(train_dataloader):
-            # 检查是否收到中断信号
+            # Check for interrupt signal
             if self.training_interrupted:
-                logger.info("检测到训练中断信号，保存最后检查点后退出本epoch...")
-                # 立刻做一次“last”保存（即使不是 checkpointing_steps 整除）
+                logger.info("Training interruption detected, saving final checkpoint before exiting epoch...")
+                # Immediately save "last" checkpoint (even if not at checkpointing_steps interval)
                 self.save_checkpoint(epoch, self.global_step, is_last=True)
                 return
 
@@ -523,7 +540,7 @@ class BaseTrainer(ABC):
                     try:
                         self.validation_sampler.run_validation_loop(
                             global_step=self.global_step,
-                            trainer=self,  # 传入trainer实例
+                            trainer=self,  # Pass trainer instance
                         )
                     except Exception as e:
                         self.accelerator.print(f"Validation sampling failed: {e}")
@@ -598,6 +615,7 @@ class BaseTrainer(ABC):
         self.setup_model_device_train_mode(stage="fit", cache=self.use_cache)
         self.configure_optimizers()
         self.setup_criterion()
+        self.setup_training_scheduler()  # Initialize scheduler for training
         self.setup_validation(train_dataloader)
 
         train_dataloader = self.accelerator_prepare(train_dataloader)
@@ -614,13 +632,53 @@ class BaseTrainer(ABC):
             if self.training_interrupted:
                 break
 
-        # 保存最后一个检查点
+        # Save final checkpoint
         self.save_checkpoint(current_epoch, self.global_step, is_last=True)
 
         logging.info(f"FPS: {self.fps_logger.last_fps()}")
         self.accelerator.wait_for_everyone()
         self.accelerator.end_training()
 
+    def setup_training_scheduler(self):
+        """Initialize scheduler timesteps for training."""
+        if self.scheduler is None:
+            logging.warning("Scheduler not loaded, skipping training scheduler setup")
+            return
+        
+        # Check if scheduler has set_train_timesteps method (custom scheduler)
+        if hasattr(self.scheduler, 'set_train_timesteps'):
+            num_timesteps = self.scheduler.config.num_train_timesteps
+            device = self.accelerator.device if self.accelerator else 'cpu'
+            self.scheduler.set_train_timesteps(
+                num_timesteps=num_timesteps,
+                device=device,
+                timestep_type='linear'
+            )
+            logging.info(f"✓ Initialized training timesteps: {len(self.scheduler.timesteps)} timesteps from {self.scheduler.timesteps[0]:.1f} to {self.scheduler.timesteps[-1]:.1f}")
+        else:
+            # Standard scheduler - manually create training timesteps
+            num_timesteps = getattr(self.scheduler.config, 'num_train_timesteps', 1000)
+            device = self.accelerator.device if self.accelerator else 'cpu'
+            timesteps = torch.linspace(num_timesteps, 1, num_timesteps, device=device)
+            self.scheduler.timesteps = timesteps
+            logging.info(f"✓ Initialized standard training timesteps: {len(timesteps)} timesteps")
+        
+        # Create separate inference scheduler (copy of training scheduler)
+        self._create_inference_scheduler()
+    
+    def _create_inference_scheduler(self):
+        """Create a separate scheduler instance for validation/inference.
+        
+        This prevents validation from corrupting training timesteps.
+        """
+        if self.scheduler is None:
+            return
+        
+        # Create a copy of the scheduler with the same configuration
+        scheduler_class = self.scheduler.__class__
+        self.inference_scheduler = scheduler_class.from_config(self.scheduler.config)
+        logging.info(f"✓ Created separate inference scheduler: {scheduler_class.__name__}")
+    
     def setup_criterion(self):
         if self.config.loss.mask_loss:
             from src.loss.edit_mask_loss import MaskEditLoss
@@ -708,7 +766,7 @@ class BaseTrainer(ABC):
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.config.train.gradient_accumulation_steps,
             # mixed_precision=self.config.train.mixed_precision,
-            mixed_precision="no",  # ← 关键
+            mixed_precision="no",  # ← Critical
             log_with=self.config.logging.report_to,
             project_config=accelerator_project_config,
         )
@@ -969,23 +1027,37 @@ class BaseTrainer(ABC):
         return image * 2.0 - 1.0
 
     def prepare_predict_timesteps(self, num_inference_steps: int, image_seq_len: int) -> Tuple[torch.Tensor, int]:
-        """prepare timesteps for prediction"""
+        """Prepare timesteps for prediction/validation inference.
+        
+        Uses a separate inference scheduler to avoid corrupting training timesteps.
+        """
+        # Use separate inference scheduler (doesn't affect training)
+        scheduler_to_use = self.inference_scheduler if self.inference_scheduler is not None else self.scheduler
+        
+        if scheduler_to_use is None:
+            raise ValueError("No scheduler available for inference")
+        
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
         mu = calculate_shift(
             image_seq_len,
-            self.scheduler.config.get("base_image_seq_len", 256),
-            self.scheduler.config.get("max_image_seq_len", 4096),
-            self.scheduler.config.get("base_shift", 0.5),
-            self.scheduler.config.get("max_shift", 1.15),
+            scheduler_to_use.config.get("base_image_seq_len", 256),
+            scheduler_to_use.config.get("max_image_seq_len", 4096),
+            scheduler_to_use.config.get("base_shift", 0.5),
+            scheduler_to_use.config.get("max_shift", 1.15),
         )
         device = next(self.dit.parameters()).device
+        
+        # This modifies inference_scheduler.timesteps (NOT training scheduler)
         timesteps, num_inference_steps = retrieve_timesteps(
-            self.scheduler,
+            scheduler_to_use,
             num_inference_steps,
             device,
             sigmas=sigmas,
             mu=mu,
         )
+        
+        logging.debug(f"Prepared {num_inference_steps} inference timesteps using separate scheduler")
+        
         return timesteps, num_inference_steps
 
     @abstractmethod

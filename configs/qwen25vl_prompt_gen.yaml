@@ -1,0 +1,122 @@
+# Configuration for fine-tuning Qwen2.5-VL-3B for prompt generation
+# Optimized for 4xA100 80GB GPUs with ~47k training samples
+
+# Model configuration
+model:
+  model_name: Qwen/Qwen2.5-VL-3B-Instruct
+  quantization: null  # Options: null, 4bit, 8bit (null enables multi-GPU training)
+
+# LoRA configuration  
+lora:
+  r: 32                          # LoRA rank (increase for more capacity, decrease to prevent overfitting)
+  lora_alpha: 16                 # LoRA scaling factor (typically equal to r)
+  lora_dropout: 0.05             # Dropout for regularization
+  target_modules:                # Language model attention layers
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+
+# Data configuration
+data:
+  # Source data (for prepare_qwen25vl_dataset.py)
+  train_csv: workspace/metadata-v12-recaptioned-long/train_filtered_2k.csv
+  train_split: 0.9               # 90% train, 10% validation
+  max_seq_length: 512            # Maximum sequence length for text
+  
+  # Prepared data directory (output of prepare script, input for training)
+  # Training uses streaming - images loaded on-demand, not all at once
+  prepared_data_dir: workspace/prepared_data
+  
+  # Prompts for chat template
+  # IMPROVED PROMPTS with few-shot examples
+  system_prompt: |
+    You are a professional photo editor with 10+ years of experience in:
+    - Technical corrections (exposure, white balance, lens distortion)
+    - Color grading and tonal adjustments
+    - Composition optimization and cropping
+    - Retouching and image cleanup
+    
+    Provide DETAILED, ACTIONABLE editing instructions with:
+    1. SPECIFIC numerical values (e.g., "+1.5 EV", "Temperature +200K")
+    2. STEP-BY-STEP sequence (numbered or bulleted)
+    3. TOOL/PANEL references (e.g., "In HSL panel:", "Use Curves:")
+    4. CLEAR categories (LIGHTING, COLOR, COMPOSITION, etc.)
+    
+    EXAMPLE OUTPUT FORMAT:
+    
+    [CATEGORY: PORTRAIT/LANDSCAPE/PRODUCT]
+    
+    LIGHTING & EXPOSURE:
+    - Increase exposure by +1.2 EV
+    - Lift shadows: +30
+    - Reduce highlights: -20
+    
+    COLOR GRADING:
+    - Temperature: +150K (warmer)
+    - Tint: +5 (add magenta)
+    - HSL > Orange: Saturation -10
+    
+    COMPOSITION:
+    - Crop to 4:5 ratio for Instagram
+    - Apply rule of thirds grid
+    
+    CORRECTIONS:
+    - Straighten horizon (+2.5 degrees)
+    - Remove lens distortion (barrel -5)
+    
+    Now analyze the provided image and give similarly detailed instructions.
+  
+  user_prompt: |
+    Analyze this photograph professionally and provide specific editing instructions.
+    Include numerical values, tool references, and step-by-step guidance.
+    
+# Training configuration (optimized for 4xA100 GPUs)
+training:
+  output_dir: /skynas/01/hardik/qwen-lora/qwen25vl-prompt-gen-lora
+  
+  # Run naming (optional - for consistent tracking)
+  # If not set, auto-generates: <config_name>_<timestamp>
+  # Used for both wandb run name and output subdirectory
+  # Example: run_name: "experiment_v1" -> /skynas/.../qwen25vl-prompt-gen-lora/experiment_v1/
+  run_name: null
+  
+  # Training schedule
+  num_train_epochs: 10           # Start with 3, reduce to 2 if overfitting
+  
+  # Batch size settings
+  # With 4 GPUs: effective batch = 4 * 2 * 8 = 64 (maintaining same effective batch size)
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 8
+  
+  # Optimizer settings
+  learning_rate: 2.0e-5          # Conservative LR for fine-tuning
+  weight_decay: 0.01             # L2 regularization
+  warmup_ratio: 0.03             # 3% warmup steps
+  lr_scheduler_type: cosine      # Cosine decay schedule
+  
+  # Logging and checkpointing
+  logging_steps: 10
+  save_steps: 500                # Save checkpoint every 500 steps
+  eval_steps: 500                # Evaluate every 500 steps (validation with loss + semantic metrics)
+  save_total_limit: 3            # Keep only 3 best checkpoints
+  
+  # Evaluation generation settings (for semantic metrics)
+  eval_generation:
+    max_new_tokens: 256          # Maximum tokens to generate during evaluation
+    do_sample: false             # Deterministic generation for consistent metrics
+  
+  # Performance optimization
+  bf16: true                     # Use bfloat16 for A100s
+  gradient_checkpointing: true   # Trade compute for memory
+  dataloader_num_workers: 0      # Disable workers to prevent process spawn issues (streaming handles this)
+  
+  # Logging and hub
+  report_to: wandb               # Options: wandb, tensorboard, none
+  push_to_hub: false             # Set to true to push to HuggingFace Hub
+  
+  # Advanced (optional)
+  # gradient_clip_norm: 1.0      # Gradient clipping (uncomment if needed)
+  # max_grad_norm: 1.0           # Max gradient norm
+

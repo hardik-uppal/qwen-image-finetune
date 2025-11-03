@@ -1,12 +1,13 @@
 trainer: QwenImageEditPlus
 
 model:
-  # TODO: replace with the actual checkpoint you plan to fine-tune (e.g. Qwen/Qwen-Image-Edit-Plus)
-  pretrained_model_name_or_path: "ovedrive/qwen-image-edit-4bit"
-  quantize: false
+  # Using full precision FP16 model (recommended with A100 80GB)
+  # Provides best quality, ~28GB VRAM usage per GPU
+  pretrained_model_name_or_path: "Qwen/Qwen-Image-Edit-2509"
+  quantize: false  # No runtime quantization needed with 80GB VRAM
   lora:
-    r: 32                     # higher rank to leverage larger dataset; adjust if VRAM becomes a constraint
-    lora_alpha: 32
+    r: 64                     # higher rank to leverage larger dataset; adjust if VRAM becomes a constraint
+    lora_alpha: 64
     init_lora_weights: gaussian
     target_modules: ["to_k", "to_q", "to_v", "to_out.0"]
     pretrained_weight: null
@@ -16,10 +17,10 @@ data:
   class_path: src.data.dataset.ImageDataset
   init_args:
     dataset_path:
-      - workspace/metadata-v12-recaptioned-long/train_filtered_2k.csv
+      - workspace/metadata-v12-recaptioned-long/train_filtered_2k_regenerated.csv
     caption_dropout_rate: 0.0
     prompt_image_dropout_rate: 0.0
-    use_edit_mask: true
+    use_edit_mask: false  # No masks in dataset
     selected_control_indexes: null  # Set to null since CSV only has one control image (path_control)
     # Image filtering thresholds (updated for 2k resized dataset)
     # All images pre-processed to max 2000px dimension
@@ -33,8 +34,8 @@ data:
         resize_mode: bilinear
         target_size: [832, 576]
         controls_size: [[832, 576]]  # Main control image uses same size as target
-  batch_size: 2               # start conservative; scale up after confirming memory headroom
-  num_workers: 4              # reduced from 8 to handle large images (8256px) more safely
+  batch_size: 4               # Per GPU batch size (4 × 8 GPUs = 32 samples per step)
+  num_workers: 8              # Data loading workers per GPU
   shuffle: true
 
 logging:
@@ -51,30 +52,36 @@ logging:
   sampling:
     enable: true
     validation_steps: 100
-    num_samples: 4
+    num_samples: 8
     seed: 42
-    validation_data: workspace/metadata-v12-recaptioned-long/val_filtered_2k.csv
+    validation_data: workspace/metadata-v12-recaptioned-long/val_filtered_2k_regenerated.csv
+    # Image quality metrics (LPIPS, MSE, PSNR) - computed when target images are available
+    compute_metrics: true  # Enable perceptual and pixel-based metrics
+    lpips_net: vgg  # LPIPS network: 'alex' (fast), 'vgg' (accurate), 'squeeze' (fastest)
 
 optimizer:
   class_path: bitsandbytes.optim.Adam8bit
   init_args:
-    lr: 5.0e-5
+    lr: 1.0e-4
     betas: [0.9, 0.999]
 
 lr_scheduler:
   scheduler_type: cosine
-  warmup_steps: 500
+  warmup_steps: 200
   num_cycles: 0.5
   power: 1.0
 
 loss:
-  mask_loss: true
-  forground_weight: 2.0
-  background_weight: 1.0
+  mask_loss: false  # No masks in dataset - using standard uniform loss
+  # Min-SNR loss weighting (recommended for better convergence)
+  use_min_snr: true               # Enable min-SNR weighting
+  min_snr_gamma: 5.0              # Gamma parameter (typical: 5.0, paper recommendation)
+  min_snr_normalize_weights: true # Normalize weights to mean ≈ 1 (prevents loss collapse)
+  prediction_type: null           # Auto-detect from scheduler (v_prediction for flow matching)
 
 train:
-  gradient_accumulation_steps: 4    # effective batch size 8 when combined with batch_size 2 across 8 GPUs
-  max_train_steps: 20000            # revisit after confirming dataset size and epochs
+  gradient_accumulation_steps: 2    # Effective batch size = 4 × 2 × 8 GPUs = 64
+  max_train_steps: 6000            # Adjust based on dataset size and convergence
   checkpointing_steps: 500
   checkpoints_total_limit: 10
   max_grad_norm: 1.0

@@ -1,0 +1,141 @@
+# IMPROVED Configuration for Qwen2.5-VL-3B Prompt Generation
+# Based on best practices for producing specific, structured editing instructions
+#
+# Key improvements over base config:
+# - Higher LoRA rank (128 vs 64) for more capacity
+# - Target FFN layers in addition to attention
+# - Higher learning rate for stronger adaptation
+# - Longer training (5 epochs vs 3)
+# - Better prompts with examples
+
+# Model configuration
+model:
+  model_name: Qwen/Qwen2.5-VL-3B-Instruct
+  quantization: null  # null for multi-GPU
+
+# LoRA configuration - IMPROVED
+lora:
+  r: 128                         # Increased from 64 for more capacity
+  lora_alpha: 256                # Higher alpha = stronger adaptation
+  lora_dropout: 0.05
+  target_modules:                # Added FFN layers for more parameters
+    # Attention layers
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    # Feed-forward layers (NEW)
+    - gate_proj
+    - up_proj
+    - down_proj
+
+# Data configuration
+data:
+  train_csv: workspace/metadata-v12-recaptioned-long/train_filtered_2k.csv
+  train_split: 0.9
+  max_seq_length: 512
+  prepared_data_dir: workspace/prepared_data
+  
+  # IMPROVED PROMPTS with few-shot examples
+  system_prompt: |
+    You are a professional photo editor with 10+ years of experience in:
+    - Technical corrections (exposure, white balance, lens distortion)
+    - Color grading and tonal adjustments
+    - Composition optimization and cropping
+    - Retouching and image cleanup
+    
+    Provide DETAILED, ACTIONABLE editing instructions with:
+    1. SPECIFIC numerical values (e.g., "+1.5 EV", "Temperature +200K")
+    2. STEP-BY-STEP sequence (numbered or bulleted)
+    3. TOOL/PANEL references (e.g., "In HSL panel:", "Use Curves:")
+    4. CLEAR categories (LIGHTING, COLOR, COMPOSITION, etc.)
+    
+    EXAMPLE OUTPUT FORMAT:
+    
+    [CATEGORY: PORTRAIT/LANDSCAPE/PRODUCT]
+    
+    LIGHTING & EXPOSURE:
+    - Increase exposure by +1.2 EV
+    - Lift shadows: +30
+    - Reduce highlights: -20
+    
+    COLOR GRADING:
+    - Temperature: +150K (warmer)
+    - Tint: +5 (add magenta)
+    - HSL > Orange: Saturation -10
+    
+    COMPOSITION:
+    - Crop to 4:5 ratio for Instagram
+    - Apply rule of thirds grid
+    
+    CORRECTIONS:
+    - Straighten horizon (+2.5 degrees)
+    - Remove lens distortion (barrel -5)
+    
+    Now analyze the provided image and give similarly detailed instructions.
+  
+  user_prompt: |
+    Analyze this photograph professionally and provide specific editing instructions.
+    Include numerical values, tool references, and step-by-step guidance.
+
+# Training configuration - IMPROVED
+training:
+  output_dir: /skynas/01/hardik/qwen-lora/qwen25vl-prompt-gen-lora-v2  # v2 for improved version
+  
+  # Run naming (optional - for consistent tracking)
+  # If not set, auto-generates: <config_name>_<timestamp>
+  # Used for both wandb run name and output subdirectory
+  # Example: run_name: "experiment_v1" -> /skynas/.../qwen25vl-prompt-gen-lora-v2/experiment_v1/
+  run_name: null
+  
+  # Training schedule - LONGER
+  num_train_epochs: 5              # Increased from 3
+  
+  # Batch size settings
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 8   # Effective batch = 64
+  
+  # Optimizer settings - MORE AGGRESSIVE
+  learning_rate: 5.0e-5            # Increased from 2.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.1                # Increased from 0.03 for stability
+  lr_scheduler_type: cosine
+  
+  # Add gradient clipping for stability
+  max_grad_norm: 1.0
+  
+  # Logging and checkpointing
+  logging_steps: 10
+  save_steps: 500
+  eval_steps: 500
+  save_total_limit: 5              # Keep more checkpoints
+  
+  # Performance optimization
+  bf16: true
+  gradient_checkpointing: true
+  dataloader_num_workers: 0
+  
+  # Logging
+  report_to: wandb
+  push_to_hub: false
+  
+  # Evaluation strategy
+  evaluation_strategy: steps
+  load_best_model_at_end: true     # Load best checkpoint
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+
+# Notes on expected improvements:
+# - Higher LoRA rank should capture more task-specific patterns
+# - FFN layer targeting adds ~50% more trainable parameters
+# - Higher LR enables stronger adaptation to your data
+# - Longer training gives model more time to learn
+# - Better prompts guide model toward structured outputs
+# 
+# Expected gains over base config:
+# - BLEU: +50-100% improvement (e.g., 0.16 → 0.24-0.32)
+# - ROUGE-L: +30-60% improvement
+# - BERTScore: +5-10% improvement
+# - Qualitative: Much more specific and structured outputs
+

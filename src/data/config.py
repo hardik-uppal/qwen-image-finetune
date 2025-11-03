@@ -312,6 +312,9 @@ class SamplingConfig(BaseModel):
     num_samples: int = 4
     seed: int = 42
     validation_data: Optional[Union[str, List[Dict[str, str]]]] = None
+    # Image quality metrics configuration
+    compute_metrics: bool = True  # Compute LPIPS, MSE, PSNR when target images are available
+    lpips_net: str = 'alex'  # LPIPS network: 'alex' (fast), 'vgg' (accurate), 'squeeze' (fastest)
 
     @model_validator(mode="after")
     def _check_when_enabled(self):
@@ -323,6 +326,10 @@ class SamplingConfig(BaseModel):
             if self.num_samples <= 0:
                 raise ValueError(
                     "num_samples must be positive when sampling is enabled"
+                )
+            if self.lpips_net not in ['alex', 'vgg', 'squeeze']:
+                raise ValueError(
+                    f"lpips_net must be one of ['alex', 'vgg', 'squeeze'], got {self.lpips_net}"
                 )
         return self
 
@@ -560,12 +567,24 @@ class LossConfig(BaseModel):
     mask_loss: bool = False
     forground_weight: float = 2.0
     background_weight: float = 1.0
+    # Min-SNR loss weighting (recommended for better convergence)
+    use_min_snr: bool = False  # Enable min-SNR weighting
+    min_snr_gamma: float = 5.0  # Gamma parameter (typical: 5.0)
+    min_snr_normalize_weights: bool = True  # Normalize weights to mean ≈ 1 (prevents loss collapse)
+    prediction_type: str | None = None  # Override prediction type ("epsilon", "v_prediction", or None for auto-detect)
 
     @field_validator("forground_weight", "background_weight")
     @classmethod
     def _non_negative(cls, v: float) -> float:
         if v < 0:
             raise ValueError("weight must be >= 0")
+        return v
+    
+    @field_validator("min_snr_gamma")
+    @classmethod
+    def _check_gamma(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("min_snr_gamma must be positive")
         return v
 
 

@@ -1,0 +1,70 @@
+# Production Pipeline Configuration with LoRA
+# Example configuration for using a custom LoRA with the image editing model
+
+# Inherit from base config
+# GPU allocation (total 8 GPUs: indices 0-7)
+gpu_allocation:
+  vl_service: [0, 1]                    # 2 GPUs for Qwen2.5-VL
+  image_edit_service: [2, 3, 4, 5, 6, 7]  # 6 GPUs for Qwen-Image-Edit-Plus
+
+# Service endpoints
+services:
+  vl_endpoint: "http://localhost:8000/v1"
+  image_edit_endpoint: "http://localhost:8001"
+
+# Model configurations
+models:
+  qwen_vl:
+    model_name: "Qwen/Qwen2.5-VL-72B-Instruct"
+    tensor_parallel_size: 2
+    max_model_len: 8192
+    gpu_memory_utilization: 0.9
+    api_key: "EMPTY"
+    # Example VL LoRA paths (uncomment and modify):
+    # lora_path: "/path/to/your/vl_lora"
+    # lora_path: "username/vl-lora-repo"
+    lora_path: null
+    lora_name: "vl_lora"
+  
+  qwen_image_edit:
+    model_name: "Qwen/Qwen-Image-Edit-2509"
+    # Example LoRA paths (uncomment and modify):
+    # lora_path: "/path/to/your/custom_lora.safetensors"
+    # lora_path: "TsienDragon/qwen-image-edit-plus-lora-face-seg"
+    # lora_path: "outputs/qwen_image_edit_plus/2024-01-01_experiment/final_checkpoint"
+    lora_path: null
+    dtype: "bfloat16"
+    num_replicas: 6
+    max_concurrent_queries_per_replica: 2
+
+# Pipeline settings
+pipeline:
+  vision_generator: "vllm_client"
+  image_editor: "ray_serve_client"
+  upscaler: "tiled"
+  
+  vision_defaults:
+    temperature: 0.2
+    max_tokens: 512
+  
+  edit_defaults:
+    num_inference_steps: 24  # Slightly more steps for LoRA
+    guidance_scale: 4.5
+    width: 768
+    height: 768
+  
+  tiling:
+    tile_width: 512
+    tile_height: 512
+    overlap: 64
+    mask_blur: 8
+    upscale_factor: 2.0
+
+# Frontend settings
+frontend:
+  host: "0.0.0.0"
+  port: 7860
+  enable_metrics: true
+  enable_queue: true
+  max_concurrent_requests: 24
+

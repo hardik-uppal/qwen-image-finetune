@@ -5,7 +5,41 @@
 ## Overview
 
 This repository provides a comprehensive framework for fine-tuning image editing tasks. The framework supports **FLUX Kontext**,**Qwen-Image-Edit**, and **Qwen-Image-Edit-2509** model architectures. Our implementation focuses on efficient training through LoRA (Low-Rank Adaptation) and features an optimized embedding cache system that achieves 2-3x training acceleration.
+
+### 🚀 Production-Ready Distributed Pipeline (NEW!)
+
+Deploy a scalable image editing pipeline across 8 GPUs with automatic load balancing:
+
+- **Qwen2.5-VL** (2 GPUs): Automatic instruction generation via vLLM
+  - ✨ **NEW**: LoRA support for domain-specific instruction generation
+- **Qwen-Image-Edit-Plus** (6 GPUs): Distributed editing with Ray Serve (30-60 images/min)
+  - ✨ **NEW**: Context-aware tiled upscaling with control images
+- **Tiled Super-Resolution**: Memory-efficient 2-4× upscaling
+- **One-Command Deployment**: Full stack with Gradio frontend
+- **Dual LoRA Support**: Both VL and editing models support custom LoRAs
+
+**Quick Start**:
+```bash
+# Install production dependencies
+pip install vllm ray[serve] aiohttp pydantic rich gradio
+
+# Launch entire pipeline on 8 GPUs
+python script/launch_production_services.py
+
+# Access at http://localhost:7860
+```
+
+**Documentation**:
+- 📖 [5-Minute Quick Start](PRODUCTION_QUICKSTART.md)
+- 📚 [Complete Deployment Guide](docs/deployment_guide.md)
+- 🏗️ [Architecture Overview](docs/production_pipeline_README.md)
+- 🔧 [Technical Deep-Dive](docs/PRODUCTION_ARCHITECTURE.md)
+- ✨ [New Features: LoRA & Context-Aware Upscaling](docs/NEW_FEATURES_SUMMARY.md)
+- 🎨 [Tiled Upscaling Guide](docs/TILED_UPSCALING_GUIDE.md)
+
 ## New
+- **🤖 Qwen2.5-VL Prompt Generation (NEW)**: Train vision-language models to automatically generate image editing prompts from control images using TRL (Transformer Reinforcement Learning). Features supervised fine-tuning with QLoRA, multi-GPU support (optimized for 8xA100), and evaluation metrics (BLEU/ROUGE/BERTScore). Perfect for automating prompt creation for image editing pipelines. See [`script/README_qwen25vl_prompt_gen.md`](script/README_qwen25vl_prompt_gen.md) for quick start.
+
 - **📚 Documentation Improvements (v2.4.1)**: Comprehensive documentation updates including MIT license badge, enhanced data preparation guide (Folder/HuggingFace/CSV sources), and English language standardization. See [CHANGELOG](docs/CHANGELOG.md) for details.
 
 - **🔥 Dynamic Shape Support (v2.4.0)**: For Qwen-Image-Edit or Plus, we introduce the fixed number of pixels condition for batch process such that it support multiple shapes.
@@ -67,7 +101,8 @@ Pretrain Model is provided in  [Huggingface `TsienDragon/character-compositing`]
 
 ## Key Features
 
-- **Dual Model Support**: Complete support for both Qwen-Image-Edit and FLUX Kontext model architectures
+- **Triple Model Support**: Support for Qwen-Image-Edit, FLUX Kontext, and **Qwen2.5-VL** (prompt generation) model architectures
+- **Vision-Language Training**: Fine-tune Qwen2.5-VL for automatic prompt generation from images using TRL's SFTTrainer
 - **Multi-Precision Training**: FP16, FP8, and FP4 quantization levels for different hardware requirements
 - **Efficient Fine-tuning**: LoRA-based parameter-efficient fine-tuning with minimal memory footprint
 - [**Edit Mask Loss** feature documentation in `docs/image_edit_mask_loss.md`](docs/image_edit_mask_loss.md) Advanced mask-weighted loss function for focused training on edit regions

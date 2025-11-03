@@ -24,7 +24,7 @@ class QwenImageEditPlusTrainer(QwenImageEditTrainer):
     def get_pipeline_class(self):
         return QwenImageEditPlusPipeline
 
-    # Static methods: directly reference QwenImageEditPipeline methods
+    # Static methods: directly reference QwenImageEditPlusPipeline methods
     _pack_latents = staticmethod(QwenImageEditPlusPipeline._pack_latents)
     _unpack_latents = staticmethod(QwenImageEditPlusPipeline._unpack_latents)
 

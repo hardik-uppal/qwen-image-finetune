@@ -25,11 +25,11 @@ def import_trainer(config: Config):
 
 
 def main():
-    """使用模块化的 Trainer 类进行训练"""
-    # 解析配置
+    """Train using modular Trainer class"""
+    # Parse configuration
     config = parse_args()
 
-    # 设置日志级别
+    # Set logging level
     if hasattr(config, 'local_rank') and config.local_rank == 0:
         transformers.utils.logging.set_verbosity_warning()
         diffusers.utils.logging.set_verbosity_info()
@@ -39,14 +39,14 @@ def main():
 
     seed_everything(1234)
 
-    # 创建训练器
+    # Create trainer
     Trainer = import_trainer(config)
     trainer = Trainer(config)
     if config.mode != TrMode.fit:
         # if not in training, skip caption dropout
         config.data.init_args.caption_dropout_rate = 0
 
-    # 加载数据
+    # Load data
     batch_size = config.data.batch_size
     shuffle = config.data.shuffle
     droplast = True
@@ -76,7 +76,7 @@ def main():
 
         trainer.cache(train_dataloader)
     else:
-        # 开始训练
+        # Start training
         trainer.fit(train_dataloader)
 
 
